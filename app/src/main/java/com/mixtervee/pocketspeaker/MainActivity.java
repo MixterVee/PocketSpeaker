@@ -131,6 +131,14 @@ public class MainActivity extends Activity {
             start.setOnClickListener(v -> beginTvCapture());
             root.addView(start, buttonParams());
 
+            Button testTone = makeButton("TEST CONNECTION TONE");
+            testTone.setOnClickListener(v -> {
+                Intent intent = new Intent(this, CaptureService.class);
+                intent.setAction(CaptureService.ACTION_TOGGLE_TEST_TONE);
+                startService(intent);
+            });
+            root.addView(testTone, buttonParams());
+
             Button stop = makeButton("STOP");
             stop.setOnClickListener(v -> {
                 stopService(new Intent(this, CaptureService.class));

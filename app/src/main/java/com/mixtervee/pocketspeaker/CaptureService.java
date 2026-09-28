@@ -21,7 +21,6 @@ import android.os.Looper;
 import android.os.PowerManager;
 
 import java.io.DataOutputStream;
-import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
@@ -41,13 +40,14 @@ public class CaptureService extends Service {
     private static final String CHANNEL_ID = "pocket_speaker_capture";
     private static final int NOTIFICATION_ID = 100;
 
-    private final ArrayBlockingQueue<byte[]> audioQueue = new ArrayBlockingQueue<>(4);
+    private static final byte[] FLUSH_MARKER = new byte[0];
+    private final ArrayBlockingQueue<byte[]> audioQueue = new ArrayBlockingQueue<>(10);
     private volatile boolean running;
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
     private DatagramSocket controlSocket;
     private Socket clientSocket;
-    private volatile OutputStream clientOut;
+    private volatile DataOutputStream clientOut;
     private Thread captureThread;
     private Thread writerThread;
     private Thread controlThread;
@@ -194,10 +194,17 @@ public class CaptureService extends Service {
 
     private void startThreads() {
         captureThread = new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
             byte[] buffer = new byte[Math.max(960, (sampleRate / 100) * channelCount * 2)];
+            long lastReadAt = 0L;
+            long silenceStartedAt = 0L;
+            boolean resyncAfterSilence = false;
+
             while (running) {
                 try {
                     int read;
+                    long beforeRead = System.currentTimeMillis();
+
                     if (testTone) {
                         read = fillTestTone(buffer);
                         long frames = read / (2L * channelCount);
@@ -207,11 +214,38 @@ public class CaptureService extends Service {
                         read = audioRecord.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
                     }
 
+                    long now = System.currentTimeMillis();
+
+                    // A decoder seek/restart can stall playback capture.  When that happens,
+                    // tell the phone to throw away any PCM it still has queued.
+                    if (!testTone && lastReadAt != 0L && beforeRead - lastReadAt > 140L) {
+                        requestResync();
+                        resyncAfterSilence = false;
+                        silenceStartedAt = 0L;
+                    }
+                    lastReadAt = now;
+
+                    if (read > 0 && !testTone) {
+                        boolean silent = isEffectivelySilent(buffer, read);
+                        if (silent) {
+                            if (silenceStartedAt == 0L) silenceStartedAt = now;
+                            if (now - silenceStartedAt >= 180L) resyncAfterSilence = true;
+                        } else {
+                            if (resyncAfterSilence) {
+                                requestResync();
+                            }
+                            silenceStartedAt = 0L;
+                            resyncAfterSilence = false;
+                        }
+                    }
+
                     if (read > 0 && clientOut != null) {
                         byte[] copy = Arrays.copyOf(buffer, read);
                         if (!audioQueue.offer(copy)) {
-                            // Never let stale audio build up: discard queued packets and keep the newest PCM.
+                            // A full queue means we're becoming audibly late. Catch up once,
+                            // rather than continuously dropping chunks and producing little gaps.
                             audioQueue.clear();
+                            audioQueue.offer(FLUSH_MARKER);
                             audioQueue.offer(copy);
                         }
                     }
@@ -225,12 +259,19 @@ public class CaptureService extends Service {
         }, "PocketSpeaker-Capture");
 
         writerThread = new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
             while (running) {
                 try {
                     byte[] data = audioQueue.poll(100, TimeUnit.MILLISECONDS);
-                    OutputStream out = clientOut;
+                    DataOutputStream out = clientOut;
                     if (data != null && out != null) {
-                        out.write(data);
+                        if (data == FLUSH_MARKER || data.length == 0) {
+                            out.writeInt(-1);
+                            out.flush();
+                        } else {
+                            out.writeInt(data.length);
+                            out.write(data);
+                        }
                     }
                 } catch (Exception e) {
                     closeClient();
@@ -274,6 +315,26 @@ public class CaptureService extends Service {
         captureThread.start();
         writerThread.start();
         controlThread.start();
+    }
+
+    private void requestResync() {
+        if (clientOut == null) return;
+        audioQueue.clear();
+        audioQueue.offer(FLUSH_MARKER);
+    }
+
+    private boolean isEffectivelySilent(byte[] data, int length) {
+        int usable = length - (length % 2);
+        int peak = 0;
+        for (int i = 0; i < usable; i += 2) {
+            int lo = data[i] & 0xff;
+            int hi = data[i + 1];
+            short sample = (short) ((hi << 8) | lo);
+            int value = Math.abs((int) sample);
+            if (value > peak) peak = value;
+            if (peak > 180) return false;
+        }
+        return true;
     }
 
     private int fillTestTone(byte[] buffer) {

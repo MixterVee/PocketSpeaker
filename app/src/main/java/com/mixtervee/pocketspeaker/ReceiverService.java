@@ -155,10 +155,18 @@ public class ReceiverService extends Service {
             sendStatus("Playing " + senderName + " audio on this phone.");
 
             byte[] buffer = new byte[8192];
+            long lastMeterUpdate = 0L;
             while (running) {
                 int read = in.read(buffer);
                 if (read < 0) break;
                 if (read > 0) {
+                    int peak = pcmPeakPercent(buffer, read);
+                    long now = System.currentTimeMillis();
+                    if (now - lastMeterUpdate >= 700L) {
+                        sendStatus("Playing " + senderName + " audio • signal " + peak + "%");
+                        lastMeterUpdate = now;
+                    }
+
                     int offset = 0;
                     while (running && offset < read) {
                         int written = audioTrack.write(
@@ -177,6 +185,19 @@ public class ReceiverService extends Service {
         } finally {
             if (session == sessionGeneration) stopSelf();
         }
+    }
+
+    private int pcmPeakPercent(byte[] data, int length) {
+        int peak = 0;
+        int usable = length - (length % 2);
+        for (int i = 0; i < usable; i += 2) {
+            int lo = data[i] & 0xff;
+            int hi = data[i + 1];
+            short sample = (short) ((hi << 8) | lo);
+            int value = Math.abs((int) sample);
+            if (value > peak) peak = value;
+        }
+        return Math.min(100, Math.round((peak / 32767f) * 100f));
     }
 
     private void sendConnectRequest(String senderIp) throws Exception {

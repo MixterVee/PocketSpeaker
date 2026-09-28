@@ -105,7 +105,7 @@ public class ReceiverService extends Service {
 
             streamSocket = serverSocket.accept();
             streamSocket.setTcpNoDelay(true);
-            streamSocket.setReceiveBufferSize(16384);
+            streamSocket.setReceiveBufferSize(32768);
 
             DataInputStream in = new DataInputStream(streamSocket.getInputStream());
             int magic = in.readInt();
@@ -143,7 +143,9 @@ public class ReceiverService extends Service {
             audioTrack = new AudioTrack.Builder()
                     .setAudioAttributes(attributes)
                     .setAudioFormat(format)
-                    .setBufferSizeInBytes(minBuffer)
+                    .setBufferSizeInBytes(Math.max(
+                            minBuffer * 2,
+                            (sampleRate * channels * 2 * 40) / 1000))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build();
@@ -152,29 +154,60 @@ public class ReceiverService extends Service {
                 throw new IllegalStateException("Could not initialize phone speaker");
             }
 
-            audioTrack.play();
-            sendStatus("Playing " + senderName + " audio on this phone.");
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
 
-            byte[] buffer = new byte[4096];
+            final int targetPrebufferBytes =
+                    Math.max((sampleRate * channels * 2 * 30) / 1000, 2048);
+            byte[] buffer = new byte[8192];
+            int bufferedBeforePlay = 0;
+            boolean playbackStarted = false;
             long lastMeterUpdate = 0L;
-            while (running) {
-                int read = in.read(buffer);
-                if (read < 0) break;
-                if (read > 0) {
-                    int peak = pcmPeakPercent(buffer, read);
-                    long now = System.currentTimeMillis();
-                    if (now - lastMeterUpdate >= 700L) {
-                        sendStatus("Playing " + senderName + " audio • signal " + peak + "%");
-                        lastMeterUpdate = now;
-                    }
 
-                    int offset = 0;
-                    while (running && offset < read) {
-                        int written = audioTrack.write(
-                                buffer, offset, read - offset, AudioTrack.WRITE_BLOCKING);
-                        if (written < 0) throw new IllegalStateException("Phone audio output failed");
-                        offset += written;
+            while (running) {
+                int packetLength = in.readInt();
+
+                if (packetLength == -1) {
+                    // Sender detected a seek/restart or had to catch up. Drop stale PCM
+                    // already queued in AudioTrack, then build a fresh small safety cushion.
+                    try {
+                        if (playbackStarted) audioTrack.pause();
+                        audioTrack.flush();
+                    } catch (Exception ignored) {
                     }
+                    bufferedBeforePlay = 0;
+                    playbackStarted = false;
+                    continue;
+                }
+
+                if (packetLength <= 0 || packetLength > 65536) {
+                    throw new IllegalStateException("Bad audio packet length");
+                }
+
+                if (buffer.length < packetLength) buffer = new byte[packetLength];
+                in.readFully(buffer, 0, packetLength);
+
+                int peak = pcmPeakPercent(buffer, packetLength);
+                long now = System.currentTimeMillis();
+                if (now - lastMeterUpdate >= 700L) {
+                    int underruns = audioTrack.getUnderrunCount();
+                    sendStatus("Playing " + senderName + " audio • signal " + peak
+                            + "% • underruns " + underruns);
+                    lastMeterUpdate = now;
+                }
+
+                int offset = 0;
+                while (running && offset < packetLength) {
+                    int written = audioTrack.write(
+                            buffer, offset, packetLength - offset, AudioTrack.WRITE_BLOCKING);
+                    if (written < 0) throw new IllegalStateException("Phone audio output failed");
+                    offset += written;
+                    if (!playbackStarted) bufferedBeforePlay += written;
+                }
+
+                if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
+                    audioTrack.play();
+                    playbackStarted = true;
+                    sendStatus("Playing " + senderName + " audio on this phone.");
                 }
             }
 

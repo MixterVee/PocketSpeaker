@@ -197,8 +197,6 @@ public class CaptureService extends Service {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
             byte[] buffer = new byte[Math.max(960, (sampleRate / 100) * channelCount * 2)];
             long lastReadAt = 0L;
-            long silenceStartedAt = 0L;
-            boolean resyncAfterSilence = false;
 
             while (running) {
                 try {
@@ -220,24 +218,8 @@ public class CaptureService extends Service {
                     // tell the phone to throw away any PCM it still has queued.
                     if (!testTone && lastReadAt != 0L && beforeRead - lastReadAt > 140L) {
                         requestResync();
-                        resyncAfterSilence = false;
-                        silenceStartedAt = 0L;
                     }
                     lastReadAt = now;
-
-                    if (read > 0 && !testTone) {
-                        boolean silent = isEffectivelySilent(buffer, read);
-                        if (silent) {
-                            if (silenceStartedAt == 0L) silenceStartedAt = now;
-                            if (now - silenceStartedAt >= 180L) resyncAfterSilence = true;
-                        } else {
-                            if (resyncAfterSilence) {
-                                requestResync();
-                            }
-                            silenceStartedAt = 0L;
-                            resyncAfterSilence = false;
-                        }
-                    }
 
                     if (read > 0 && clientOut != null) {
                         byte[] copy = Arrays.copyOf(buffer, read);
@@ -321,20 +303,6 @@ public class CaptureService extends Service {
         if (clientOut == null) return;
         audioQueue.clear();
         audioQueue.offer(FLUSH_MARKER);
-    }
-
-    private boolean isEffectivelySilent(byte[] data, int length) {
-        int usable = length - (length % 2);
-        int peak = 0;
-        for (int i = 0; i < usable; i += 2) {
-            int lo = data[i] & 0xff;
-            int hi = data[i + 1];
-            short sample = (short) ((hi << 8) | lo);
-            int value = Math.abs((int) sample);
-            if (value > peak) peak = value;
-            if (peak > 180) return false;
-        }
-        return true;
     }
 
     private int fillTestTone(byte[] buffer) {

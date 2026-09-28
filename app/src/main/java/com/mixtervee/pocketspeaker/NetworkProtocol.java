@@ -11,7 +11,7 @@ import java.util.List;
 final class NetworkProtocol {
     static final int CONTROL_PORT = 50005;
     static final int STREAM_PORT = 50008;
-    static final int STREAM_MAGIC = 0x50534B31; // "PSK1"
+    static final int STREAM_MAGIC = 0x50534B32; // "PSK2" - framed audio protocol
 
     static final String DISCOVER = "PS1|DISCOVER";
     static final String SENDER_PREFIX = "PS1|SENDER|";

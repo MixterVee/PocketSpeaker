@@ -41,7 +41,7 @@ public class CaptureService extends Service {
     private static final String CHANNEL_ID = "pocket_speaker_capture";
     private static final int NOTIFICATION_ID = 100;
 
-    private final ArrayBlockingQueue<byte[]> audioQueue = new ArrayBlockingQueue<>(48);
+    private final ArrayBlockingQueue<byte[]> audioQueue = new ArrayBlockingQueue<>(4);
     private volatile boolean running;
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
@@ -176,7 +176,7 @@ public class CaptureService extends Service {
 
                 AudioRecord record = new AudioRecord.Builder()
                         .setAudioFormat(format)
-                        .setBufferSizeInBytes(Math.max(minBuffer * 2, 16384))
+                        .setBufferSizeInBytes(Math.max(minBuffer, 4096))
                         .setAudioPlaybackCaptureConfig(config)
                         .build();
 
@@ -194,7 +194,7 @@ public class CaptureService extends Service {
 
     private void startThreads() {
         captureThread = new Thread(() -> {
-            byte[] buffer = new byte[4096];
+            byte[] buffer = new byte[Math.max(960, (sampleRate / 100) * channelCount * 2)];
             while (running) {
                 try {
                     int read;
@@ -210,7 +210,8 @@ public class CaptureService extends Service {
                     if (read > 0 && clientOut != null) {
                         byte[] copy = Arrays.copyOf(buffer, read);
                         if (!audioQueue.offer(copy)) {
-                            audioQueue.poll();
+                            // Never let stale audio build up: discard queued packets and keep the newest PCM.
+                            audioQueue.clear();
                             audioQueue.offer(copy);
                         }
                     }
@@ -226,7 +227,7 @@ public class CaptureService extends Service {
         writerThread = new Thread(() -> {
             while (running) {
                 try {
-                    byte[] data = audioQueue.poll(500, TimeUnit.MILLISECONDS);
+                    byte[] data = audioQueue.poll(100, TimeUnit.MILLISECONDS);
                     OutputStream out = clientOut;
                     if (data != null && out != null) {
                         out.write(data);
@@ -302,6 +303,7 @@ public class CaptureService extends Service {
         try {
             Socket socket = new Socket();
             socket.setTcpNoDelay(true);
+            socket.setSendBufferSize(16384);
             socket.connect(new InetSocketAddress(ip, port), 4000);
             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
             out.writeInt(NetworkProtocol.STREAM_MAGIC);

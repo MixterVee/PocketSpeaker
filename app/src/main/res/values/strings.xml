@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Pocket Speaker</string>
+    <string name="channel_capture">TV audio capture</string>
+    <string name="channel_receiver">Phone speaker</string>
+</resources>

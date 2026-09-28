@@ -105,6 +105,7 @@ public class ReceiverService extends Service {
 
             streamSocket = serverSocket.accept();
             streamSocket.setTcpNoDelay(true);
+            streamSocket.setReceiveBufferSize(16384);
 
             DataInputStream in = new DataInputStream(streamSocket.getInputStream());
             int magic = in.readInt();
@@ -142,7 +143,7 @@ public class ReceiverService extends Service {
             audioTrack = new AudioTrack.Builder()
                     .setAudioAttributes(attributes)
                     .setAudioFormat(format)
-                    .setBufferSizeInBytes(Math.max(minBuffer * 2, 8192))
+                    .setBufferSizeInBytes(minBuffer)
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build();
@@ -154,7 +155,7 @@ public class ReceiverService extends Service {
             audioTrack.play();
             sendStatus("Playing " + senderName + " audio on this phone.");
 
-            byte[] buffer = new byte[8192];
+            byte[] buffer = new byte[4096];
             long lastMeterUpdate = 0L;
             while (running) {
                 int read = in.read(buffer);

@@ -33,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 
 public class CaptureService extends Service {
     static final String ACTION_START = "com.mixtervee.pocketspeaker.START_CAPTURE";
+    static final String ACTION_TOGGLE_TEST_TONE = "com.mixtervee.pocketspeaker.TOGGLE_TEST_TONE";
     static final String ACTION_STATUS = "com.mixtervee.pocketspeaker.SENDER_STATUS";
     static final String EXTRA_RESULT_CODE = "resultCode";
     static final String EXTRA_RESULT_DATA = "resultData";
@@ -53,6 +54,8 @@ public class CaptureService extends Service {
     private int sampleRate = 48000;
     private int channelCount = 2;
     private PowerManager.WakeLock wakeLock;
+    private volatile boolean testTone;
+    private double tonePhase;
 
     @Override
     public void onCreate() {
@@ -62,7 +65,21 @@ public class CaptureService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || !ACTION_START.equals(intent.getAction())) {
+        if (intent == null) return START_NOT_STICKY;
+
+        if (ACTION_TOGGLE_TEST_TONE.equals(intent.getAction())) {
+            if (!running) {
+                sendStatus("Start TV Audio first, then connect the phone.");
+                return START_NOT_STICKY;
+            }
+            testTone = !testTone;
+            sendStatus(testTone
+                    ? "TEST TONE ON — the phone should play a steady tone."
+                    : "TEST TONE OFF — back to captured TV audio.");
+            return START_NOT_STICKY;
+        }
+
+        if (!ACTION_START.equals(intent.getAction())) {
             return START_NOT_STICKY;
         }
 
@@ -180,7 +197,16 @@ public class CaptureService extends Service {
             byte[] buffer = new byte[4096];
             while (running) {
                 try {
-                    int read = audioRecord.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
+                    int read;
+                    if (testTone) {
+                        read = fillTestTone(buffer);
+                        long frames = read / (2L * channelCount);
+                        long sleepMs = Math.max(1L, (frames * 1000L) / sampleRate);
+                        Thread.sleep(sleepMs);
+                    } else {
+                        read = audioRecord.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
+                    }
+
                     if (read > 0 && clientOut != null) {
                         byte[] copy = Arrays.copyOf(buffer, read);
                         if (!audioQueue.offer(copy)) {
@@ -188,6 +214,8 @@ public class CaptureService extends Service {
                             audioQueue.offer(copy);
                         }
                     }
+                } catch (InterruptedException ignored) {
+                    if (!running) break;
                 } catch (Exception e) {
                     if (running) sendStatus("Audio capture stopped: " + safeMessage(e));
                     break;
@@ -245,6 +273,27 @@ public class CaptureService extends Service {
         captureThread.start();
         writerThread.start();
         controlThread.start();
+    }
+
+    private int fillTestTone(byte[] buffer) {
+        final double frequency = 440.0;
+        final double amplitude = 0.22 * Short.MAX_VALUE;
+        final double step = 2.0 * Math.PI * frequency / sampleRate;
+        int bytesPerFrame = 2 * channelCount;
+        int frames = buffer.length / bytesPerFrame;
+        int index = 0;
+
+        for (int frame = 0; frame < frames; frame++) {
+            short sample = (short) (Math.sin(tonePhase) * amplitude);
+            tonePhase += step;
+            if (tonePhase >= Math.PI * 2.0) tonePhase -= Math.PI * 2.0;
+
+            for (int channel = 0; channel < channelCount; channel++) {
+                buffer[index++] = (byte) (sample & 0xff);
+                buffer[index++] = (byte) ((sample >>> 8) & 0xff);
+            }
+        }
+        return index;
     }
 
     private synchronized void connectClient(String ip, int port) {
@@ -317,6 +366,7 @@ public class CaptureService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        testTone = false;
         if (controlSocket != null) controlSocket.close();
         closeClient();
 

@@ -36,6 +36,7 @@ public class MainActivity extends Activity {
 
     private boolean isTv;
     private TextView statusText;
+    private TextView audioModeText;
     private Button testToneButton;
     private Button latencyModeButton;
     private LinearLayout deviceList;
@@ -161,13 +162,19 @@ public class MainActivity extends Activity {
             });
             root.addView(stop, buttonParams());
         } else {
+            audioModeText = new TextView(this);
+            audioModeText.setTextSize(18);
+            audioModeText.setGravity(Gravity.CENTER);
+            audioModeText.setPadding(0, dp(4), 0, dp(8));
+            root.addView(audioModeText, matchWrap());
+
             latencyModeButton = makeButton("");
-            updateLatencyModeButton();
+            updateLatencyModeUi();
             latencyModeButton.setOnClickListener(v -> {
                 boolean enabled = !isLowLatencyEnabled();
                 getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
                         .edit().putBoolean("low_latency_mode", enabled).apply();
-                updateLatencyModeButton();
+                updateLatencyModeUi();
                 statusText.setText(enabled
                         ? "Low latency UDP selected. Tap a TV to test it."
                         : "Stable TCP selected. Tap a TV to connect.");
@@ -240,11 +247,23 @@ public class MainActivity extends Activity {
                 .getBoolean("low_latency_mode", true);
     }
 
-    private void updateLatencyModeButton() {
-        if (latencyModeButton == null) return;
-        latencyModeButton.setText(isLowLatencyEnabled()
-                ? "AUDIO MODE: LOW LATENCY (UDP)"
-                : "AUDIO MODE: STABLE (TCP)");
+    private void updateLatencyModeUi() {
+        boolean lowLatency = isLowLatencyEnabled();
+
+        if (audioModeText != null) {
+            audioModeText.setText(lowLatency
+                    ? "CURRENT MODE\nLOW LATENCY (UDP)"
+                    : "CURRENT MODE\nSTABLE (TCP)");
+            audioModeText.setTextColor(lowLatency
+                    ? Color.rgb(120, 220, 170)
+                    : Color.LTGRAY);
+        }
+
+        if (latencyModeButton != null) {
+            latencyModeButton.setText(lowLatency
+                    ? "SWITCH TO STABLE (TCP)"
+                    : "SWITCH TO LOW LATENCY (UDP)");
+        }
     }
 
     private LinearLayout.LayoutParams matchWrap() {

@@ -356,24 +356,133 @@ public class MainActivity extends Activity {
 
     private void addDiscoveredDevice(String name, String ip) {
         runOnUiThread(() -> {
-            if (deviceButtons.containsKey(ip)) return;
+            Button existing = deviceButtons.get(ip);
+            if (existing != null) {
+                existing.setTag(name);
+                existing.setText(sourceButtonLabel(name, ip));
+                return;
+            }
+
             statusText.setText("TV found. Tap it to listen.");
+
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+
+            Button button = makeButton(sourceButtonLabel(name, ip));
+            button.setTag(name);
+            button.setOnClickListener(v ->
+                    connectToSender(String.valueOf(button.getTag()), ip));
+
+            LinearLayout.LayoutParams connectParams =
+                    new LinearLayout.LayoutParams(0, dp(62), 1f);
+            connectParams.setMargins(0, dp(6), dp(6), dp(6));
+            row.addView(button, connectParams);
+
+            Button rename = makeButton("RENAME");
+            rename.setTextSize(14);
+            rename.setOnClickListener(v ->
+                    showRemoteRenameDialog(String.valueOf(button.getTag()), ip, button));
+
+            LinearLayout.LayoutParams renameParams =
+                    new LinearLayout.LayoutParams(dp(104), dp(62));
+            renameParams.setMargins(dp(6), dp(6), 0, dp(6));
+            row.addView(rename, renameParams);
+
+            deviceButtons.put(ip, button);
 
             String lastIp = getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
                     .getString("last_source_ip", "");
-            boolean isLast = ip.equals(lastIp);
-            String label = (isLast ? "LAST • " : "") + name + "   •   " + ip;
-
-            Button button = makeButton(label);
-            button.setOnClickListener(v -> connectToSender(name, ip));
-            deviceButtons.put(ip, button);
-
-            if (isLast) {
-                deviceList.addView(button, 0, buttonParams());
+            if (ip.equals(lastIp)) {
+                deviceList.addView(row, 0, matchWrap());
             } else {
-                deviceList.addView(button, buttonParams());
+                deviceList.addView(row, matchWrap());
             }
         });
+    }
+
+    private String sourceButtonLabel(String name, String ip) {
+        String lastIp = getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                .getString("last_source_ip", "");
+        return (ip.equals(lastIp) ? "LAST • " : "") + name + "   •   " + ip;
+    }
+
+    private void showRemoteRenameDialog(String currentName, String ip, Button sourceButton) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setText(currentName);
+        input.setSelectAllOnFocus(true);
+        input.setPadding(dp(18), dp(12), dp(18), dp(12));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Rename source")
+                .setMessage("This name is saved on the TV device.")
+                .setView(input)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", null)
+                .create();
+
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(v -> {
+                    String name = input.getText() == null
+                            ? "" : input.getText().toString().replace("\n", " ").trim();
+                    if (name.length() > 32) name = name.substring(0, 32).trim();
+
+                    sendRenameToSource(ip, name, sourceButton);
+                    dialog.dismiss();
+                }));
+
+        dialog.show();
+        input.requestFocus();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setSoftInputMode(
+                    WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+        }
+    }
+
+    private void sendRenameToSource(String ip, String requestedName, Button sourceButton) {
+        statusText.setText("Renaming source…");
+
+        new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.setSoTimeout(1200);
+                String message = NetworkProtocol.RENAME_PREFIX + requestedName;
+                byte[] bytes = message.getBytes(StandardCharsets.UTF_8);
+                socket.send(new DatagramPacket(
+                        bytes, bytes.length,
+                        InetAddress.getByName(ip), NetworkProtocol.CONTROL_PORT));
+
+                byte[] replyBuffer = new byte[512];
+                DatagramPacket reply = new DatagramPacket(replyBuffer, replyBuffer.length);
+                socket.receive(reply);
+
+                String response = new String(
+                        reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8);
+                if (response.startsWith(NetworkProtocol.SENDER_PREFIX)) {
+                    String savedName =
+                            response.substring(NetworkProtocol.SENDER_PREFIX.length()).trim();
+                    if (savedName.isEmpty()) savedName = "Android TV";
+
+                    final String finalName = savedName;
+                    runOnUiThread(() -> {
+                        sourceButton.setTag(finalName);
+                        sourceButton.setText(sourceButtonLabel(finalName, ip));
+
+                        String lastIp = getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                                .getString("last_source_ip", "");
+                        if (ip.equals(lastIp)) {
+                            getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                                    .edit().putString("last_source_name", finalName).apply();
+                        }
+
+                        statusText.setText("Source renamed to “" + finalName + "”.");
+                    });
+                }
+            } catch (Exception e) {
+                runOnUiThread(() ->
+                        statusText.setText("Rename sent. The source name should update shortly."));
+            }
+        }, "PocketSpeaker-Rename").start();
     }
 
     private void connectToSender(String name, String ip) {

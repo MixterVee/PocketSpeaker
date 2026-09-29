@@ -40,6 +40,9 @@ public class CaptureService extends Service {
     static final String EXTRA_RESULT_CODE = "resultCode";
     static final String EXTRA_RESULT_DATA = "resultData";
 
+    static final String PREFS = "pocket_speaker";
+    static final String PREF_SOURCE_NAME = "source_name";
+
     private static final String CHANNEL_ID = "pocket_speaker_capture";
     private static final int NOTIFICATION_ID = 100;
 
@@ -294,7 +297,7 @@ public class CaptureService extends Service {
                     String msg = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
 
                     if (NetworkProtocol.DISCOVER.equals(msg)) {
-                        String response = NetworkProtocol.SENDER_PREFIX + Build.MODEL;
+                        String response = NetworkProtocol.SENDER_PREFIX + getSourceName(this);
                         byte[] reply = response.getBytes(StandardCharsets.UTF_8);
                         controlSocket.send(new DatagramPacket(
                                 reply, reply.length, packet.getAddress(), packet.getPort()));
@@ -368,6 +371,13 @@ public class CaptureService extends Service {
             }
         }
         return index;
+    }
+
+    static String getSourceName(Context context) {
+        String name = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(PREF_SOURCE_NAME, "");
+        if (name == null || name.trim().isEmpty()) return Build.MODEL;
+        return name.trim();
     }
 
     private int getSenderTransport() {

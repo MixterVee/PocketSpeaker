@@ -105,7 +105,7 @@ public class ReceiverService extends Service {
 
             streamSocket = serverSocket.accept();
             streamSocket.setTcpNoDelay(true);
-            streamSocket.setReceiveBufferSize(32768);
+            streamSocket.setReceiveBufferSize(65536);
 
             DataInputStream in = new DataInputStream(streamSocket.getInputStream());
             int magic = in.readInt();
@@ -144,8 +144,8 @@ public class ReceiverService extends Service {
                     .setAudioAttributes(attributes)
                     .setAudioFormat(format)
                     .setBufferSizeInBytes(Math.max(
-                            minBuffer * 2,
-                            (sampleRate * channels * 2 * 40) / 1000))
+                            minBuffer * 3,
+                            (sampleRate * channels * 2 * 140) / 1000))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build();
@@ -157,7 +157,7 @@ public class ReceiverService extends Service {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
 
             final int targetPrebufferBytes =
-                    Math.max((sampleRate * channels * 2 * 30) / 1000, 2048);
+                    Math.max((sampleRate * channels * 2 * 80) / 1000, 4096);
             byte[] buffer = new byte[8192];
             int bufferedBeforePlay = 0;
             boolean playbackStarted = false;

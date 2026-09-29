@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      POCKETSPEAKER_SIGNING_PASSWORD: ${{ secrets.POCKETSPEAKER_SIGNING_PASSWORD }}
 
     steps:
       - name: Checkout
@@ -29,11 +31,26 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --stacktrace
+      - name: Decrypt release signing key
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in signing/pocketspeaker-release.p12.enc \
+            -out signing/pocketspeaker-release.p12 \
+            -pass env:POCKETSPEAKER_SIGNING_PASSWORD
+
+      - name: Build signed test APK
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Verify APK signature
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs \
+            app/build/outputs/apk/release/app-release.apk
+
+      - name: Prepare test APK
+        run: cp app/build/outputs/apk/release/app-release.apk PocketSpeaker-v1.1.0-beta1.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: PocketSpeaker-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: PocketSpeaker-v1.1.0-beta1-signed
+          path: PocketSpeaker-v1.1.0-beta1.apk

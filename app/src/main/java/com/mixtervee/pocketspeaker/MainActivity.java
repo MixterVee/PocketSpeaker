@@ -37,6 +37,7 @@ public class MainActivity extends Activity {
     private boolean isTv;
     private TextView statusText;
     private Button testToneButton;
+    private Button latencyModeButton;
     private LinearLayout deviceList;
     private volatile boolean discovering;
     private DatagramSocket discoverySocket;
@@ -160,6 +161,19 @@ public class MainActivity extends Activity {
             });
             root.addView(stop, buttonParams());
         } else {
+            latencyModeButton = makeButton("");
+            updateLatencyModeButton();
+            latencyModeButton.setOnClickListener(v -> {
+                boolean enabled = !isLowLatencyEnabled();
+                getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                        .edit().putBoolean("low_latency_mode", enabled).apply();
+                updateLatencyModeButton();
+                statusText.setText(enabled
+                        ? "Low latency UDP selected. Tap a TV to test it."
+                        : "Stable TCP selected. Tap a TV to connect.");
+            });
+            root.addView(latencyModeButton, buttonParams());
+
             deviceList = new LinearLayout(this);
             deviceList.setOrientation(LinearLayout.VERTICAL);
             root.addView(deviceList, matchWrap());
@@ -219,6 +233,18 @@ public class MainActivity extends Activity {
             dialog.getWindow().setSoftInputMode(
                     WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         }
+    }
+
+    private boolean isLowLatencyEnabled() {
+        return getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                .getBoolean("low_latency_mode", false);
+    }
+
+    private void updateLatencyModeButton() {
+        if (latencyModeButton == null) return;
+        latencyModeButton.setText(isLowLatencyEnabled()
+                ? "AUDIO MODE: LOW LATENCY (UDP)"
+                : "AUDIO MODE: STABLE (TCP)");
     }
 
     private LinearLayout.LayoutParams matchWrap() {
@@ -494,9 +520,12 @@ public class MainActivity extends Activity {
 
         Intent intent = new Intent(this, ReceiverService.class);
         intent.setAction(ReceiverService.ACTION_CONNECT);
+        boolean lowLatency = isLowLatencyEnabled();
         intent.putExtra(ReceiverService.EXTRA_SENDER_IP, ip);
         intent.putExtra(ReceiverService.EXTRA_SENDER_NAME, name);
+        intent.putExtra(ReceiverService.EXTRA_LOW_LATENCY, lowLatency);
         startForegroundService(intent);
-        statusText.setText("Connecting to " + name + "…");
+        statusText.setText("Connecting to " + name
+                + (lowLatency ? " in low latency mode…" : " in stable mode…"));
     }
 }

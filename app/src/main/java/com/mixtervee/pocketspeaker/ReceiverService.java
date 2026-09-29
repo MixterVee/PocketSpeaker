@@ -285,6 +285,10 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
+        int adaptiveExtraMs = 0;
+        int lastUnderrunCount = 0;
+        int recentUnderruns = 0;
+        long underrunWindowStarted = 0L;
         String transportLabel = "Network";
 
         try {
@@ -417,7 +421,7 @@ public class ReceiverService extends Service {
                 int prebufferMs = senderTransport == 1 ? 30
                         : (senderTransport == 2 ? 17 : 25);
                 int targetPrebufferBytes = Math.max(
-                        (sampleRate * channels * 2 * prebufferMs) / 1000,
+                        (sampleRate * channels * 2 * (prebufferMs + adaptiveExtraMs)) / 1000,
                         audioLength * 2);
 
                 if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
@@ -429,11 +433,49 @@ public class ReceiverService extends Service {
                 long now = System.currentTimeMillis();
                 if (now - lastMeterUpdate >= 700L) {
                     int underruns = audioTrack.getUnderrunCount();
-                    sendStatus("Playing " + senderName + " • LOW LATENCY UDP • "
-                            + transportLabel + " • signal " + peak
-                            + "% • lost " + packetLoss
-                            + " • underruns " + underruns
-                            + " • resyncs " + activeResyncId);
+
+                    if (underrunWindowStarted != 0L
+                            && now - underrunWindowStarted > 30000L) {
+                        recentUnderruns = 0;
+                        underrunWindowStarted = 0L;
+                    }
+
+                    if (underruns > lastUnderrunCount) {
+                        int newUnderruns = underruns - lastUnderrunCount;
+                        lastUnderrunCount = underruns;
+
+                        if (underrunWindowStarted == 0L) {
+                            underrunWindowStarted = now;
+                        }
+                        recentUnderruns += newUnderruns;
+
+                        // Two underruns inside 30 seconds means this connection needs
+                        // a little more cushion. Add only 5 ms at a time, up to 15 ms.
+                        if (recentUnderruns >= 2 && adaptiveExtraMs < 15) {
+                            adaptiveExtraMs += 5;
+                            recentUnderruns = 0;
+                            underrunWindowStarted = now;
+
+                            // Pause briefly and rebuild the new cushion without flushing
+                            // already-received audio. This avoids permanently increasing
+                            // latency unless the connection actually proves it needs it.
+                            if (playbackStarted) {
+                                try {
+                                    audioTrack.pause();
+                                } catch (Exception ignored) {
+                                }
+                                playbackStarted = false;
+                                bufferedBeforePlay = 0;
+                            }
+                        }
+                    }
+
+                    sendStatus("UDP " + transportLabel
+                            + " • signal " + peak + "%"
+                            + " • cushion +" + adaptiveExtraMs + " ms\n"
+                            + "Lost " + packetLoss
+                            + " • Underruns " + underruns
+                            + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;
                 }
             }

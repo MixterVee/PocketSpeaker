@@ -26,8 +26,11 @@ import android.os.PowerManager;
 import java.io.DataOutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -54,8 +57,13 @@ public class CaptureService extends Service {
     private DatagramSocket controlSocket;
     private Socket clientSocket;
     private volatile DataOutputStream clientOut;
+    private DatagramSocket audioUdpSocket;
+    private volatile InetAddress clientAddress;
+    private volatile boolean lowLatencyClient;
+    private volatile int clientAudioPort = NetworkProtocol.UDP_AUDIO_PORT;
     private volatile String clientIp;
     private volatile int clientResyncPort = NetworkProtocol.RESYNC_PORT;
+    private volatile int udpSequence;
     private volatile int resyncId;
     private Thread captureThread;
     private Thread writerThread;
@@ -228,7 +236,7 @@ public class CaptureService extends Service {
                         requestResync();
                     }
 
-                    if (read > 0 && clientOut != null) {
+                    if (read > 0 && clientActive()) {
                         byte[] copy = Arrays.copyOf(buffer, read);
                         if (!audioQueue.offer(copy)) {
                             // We are badly backed up. Jump the receiver to fresh audio instead
@@ -268,8 +276,17 @@ public class CaptureService extends Service {
             while (running) {
                 try {
                     byte[] data = audioQueue.poll(100, TimeUnit.MILLISECONDS);
+                    if (data == null) continue;
+
+                    if (lowLatencyClient && audioUdpSocket != null && clientAddress != null) {
+                        if (data != FLUSH_MARKER && data.length > 0) {
+                            sendUdpAudio(data);
+                        }
+                        continue;
+                    }
+
                     DataOutputStream out = clientOut;
-                    if (data != null && out != null) {
+                    if (out != null) {
                         if (data == FLUSH_MARKER || data.length == 0) {
                             out.writeInt(-1);
                             out.writeInt(resyncId);
@@ -329,7 +346,18 @@ public class CaptureService extends Service {
                             int resyncPort = parts.length > 1
                                     ? Integer.parseInt(parts[1])
                                     : NetworkProtocol.RESYNC_PORT;
-                            connectClient(packet.getAddress().getHostAddress(), port, resyncPort);
+                            int audioPort = parts.length > 2
+                                    ? Integer.parseInt(parts[2])
+                                    : NetworkProtocol.UDP_AUDIO_PORT;
+                            boolean lowLatency = parts.length > 3
+                                    && "UDP".equalsIgnoreCase(parts[3]);
+                            if (lowLatency) {
+                                connectUdpClient(packet.getAddress().getHostAddress(),
+                                        audioPort, resyncPort);
+                            } else {
+                                connectClient(packet.getAddress().getHostAddress(),
+                                        port, resyncPort);
+                            }
                         } catch (Exception ignored) {
                         }
                     }
@@ -348,7 +376,7 @@ public class CaptureService extends Service {
     }
 
     private void requestResync() {
-        if (clientOut == null) return;
+        if (!clientActive()) return;
 
         int id = ++resyncId;
         audioQueue.clear();
@@ -370,6 +398,46 @@ public class CaptureService extends Service {
         }
 
         audioQueue.offer(FLUSH_MARKER);
+    }
+
+    private boolean clientActive() {
+        return clientOut != null
+                || (lowLatencyClient && audioUdpSocket != null && clientAddress != null);
+    }
+
+    private void sendUdpAudio(byte[] data) throws Exception {
+        DatagramSocket socket = audioUdpSocket;
+        InetAddress address = clientAddress;
+        if (socket == null || address == null) return;
+
+        final int bytesPerFrame = Math.max(2, channelCount * 2);
+        int payloadTarget = Math.max(bytesPerFrame,
+                (sampleRate * bytesPerFrame) / 200); // about 5 ms
+        payloadTarget -= payloadTarget % bytesPerFrame;
+        if (payloadTarget <= 0) payloadTarget = bytesPerFrame;
+
+        int offset = 0;
+        while (offset < data.length && lowLatencyClient) {
+            int length = Math.min(payloadTarget, data.length - offset);
+            length -= length % bytesPerFrame;
+            if (length <= 0) break;
+
+            ByteBuffer packet = ByteBuffer.allocate(28 + length)
+                    .order(ByteOrder.BIG_ENDIAN);
+            packet.putInt(NetworkProtocol.UDP_AUDIO_MAGIC);
+            packet.putInt(++udpSequence);
+            packet.putInt(resyncId);
+            packet.putInt(sampleRate);
+            packet.putInt(channelCount);
+            packet.putInt(AudioFormat.ENCODING_PCM_16BIT);
+            packet.putInt(getSenderTransport());
+            packet.put(data, offset, length);
+
+            byte[] bytes = packet.array();
+            socket.send(new DatagramPacket(
+                    bytes, bytes.length, address, clientAudioPort));
+            offset += length;
+        }
     }
 
     private int fillTestTone(byte[] buffer) {
@@ -437,22 +505,54 @@ public class CaptureService extends Service {
             clientIp = ip;
             clientResyncPort = resyncPort;
             resyncId = 0;
-            sendStatus("Connected to phone at " + ip + ".");
+            sendStatus("Connected to phone at " + ip + " • STABLE TCP.");
         } catch (Exception e) {
             closeClient();
             sendStatus("Could not connect to phone: " + safeMessage(e));
         }
     }
 
+    private synchronized void connectUdpClient(String ip, int audioPort, int resyncPort) {
+        closeClient();
+        audioQueue.clear();
+        try {
+            DatagramSocket socket = new DatagramSocket();
+            socket.setSendBufferSize(32768);
+            clientAddress = InetAddress.getByName(ip);
+            audioUdpSocket = socket;
+            lowLatencyClient = true;
+            clientAudioPort = audioPort;
+            clientIp = ip;
+            clientResyncPort = resyncPort;
+            udpSequence = 0;
+            resyncId = 0;
+            sendStatus("Connected to phone at " + ip + " • LOW LATENCY UDP.");
+        } catch (Exception e) {
+            closeClient();
+            sendStatus("Could not start low latency stream: " + safeMessage(e));
+        }
+    }
+
     private synchronized void closeClient() {
         clientOut = null;
+        lowLatencyClient = false;
+        clientAddress = null;
+
         try {
             if (clientSocket != null) clientSocket.close();
         } catch (Exception ignored) {
         }
         clientSocket = null;
+
+        if (audioUdpSocket != null) {
+            audioUdpSocket.close();
+        }
+        audioUdpSocket = null;
+
         clientIp = null;
+        clientAudioPort = NetworkProtocol.UDP_AUDIO_PORT;
         clientResyncPort = NetworkProtocol.RESYNC_PORT;
+        udpSequence = 0;
         audioQueue.clear();
     }
 

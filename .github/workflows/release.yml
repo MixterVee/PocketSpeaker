@@ -1,0 +1,80 @@
+name: Release PocketSpeaker 1.0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      POCKETSPEAKER_SIGNING_PASSWORD: ${{ secrets.POCKETSPEAKER_SIGNING_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android 35 SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Check signing secret
+        run: |
+          if [ -z "${POCKETSPEAKER_SIGNING_PASSWORD:-}" ]; then
+            echo "::error::Repository secret POCKETSPEAKER_SIGNING_PASSWORD is not configured."
+            exit 1
+          fi
+
+      - name: Decrypt release signing key
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000             -in signing/pocketspeaker-release.p12.enc             -out signing/pocketspeaker-release.p12             -pass env:POCKETSPEAKER_SIGNING_PASSWORD
+
+      - name: Build signed release APK
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Verify APK signature
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs             app/build/outputs/apk/release/app-release.apk
+
+      - name: Prepare release APK
+        run: cp app/build/outputs/apk/release/app-release.apk PocketSpeaker-v1.0.0.apk
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketSpeaker-v1.0.0-signed
+          path: PocketSpeaker-v1.0.0.apk
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.0.0 PocketSpeaker-v1.0.0.apk             --target "$GITHUB_SHA"             --title "PocketSpeaker 1.0.0"             --notes "PocketSpeaker 1.0.0
+
+          First stable release.
+
+          Highlights:
+          - Stream supported Android TV / Google TV playback audio to an Android phone over LAN
+          - Adaptive Ethernet/Wi-Fi buffering
+          - Automatic underrun recovery and resync
+          - Custom source names
+          - Last-used source prioritization
+          - Connection test tone
+          - Android TV launcher artwork
+
+          Known limitation:
+          - NVIDIA Shield currently returns silent internal playback capture and is not supported."

@@ -37,7 +37,6 @@ public class MainActivity extends Activity {
     private Button testToneButton;
     private LinearLayout deviceList;
     private volatile boolean discovering;
-    private boolean bootAutoStartLaunch;
     private DatagramSocket discoverySocket;
     private Thread discoveryThread;
     private final Map<String, Button> deviceButtons = new LinkedHashMap<>();
@@ -63,22 +62,6 @@ public class MainActivity extends Activity {
         isTv = detectTv();
         buildUi();
 
-        if (isTv) {
-            boolean autoStartEnabled = getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                    .getBoolean(BootReceiver.PREF_AUTO_START_BOOT, false);
-            boolean pendingBootStart = getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                    .getBoolean(BootReceiver.PREF_BOOT_START_PENDING, false);
-            bootAutoStartLaunch = autoStartEnabled &&
-                    (getIntent().getBooleanExtra(BootReceiver.EXTRA_BOOT_AUTO_START, false)
-                            || pendingBootStart);
-
-            if (bootAutoStartLaunch) {
-                getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                        .edit().putBoolean(BootReceiver.PREF_BOOT_START_PENDING, false).apply();
-                statusText.setText("Auto-start: waiting for Android capture approval…");
-                statusText.postDelayed(this::beginTvCapture, 1200);
-            }
-        }
     }
 
     @Override
@@ -156,20 +139,6 @@ public class MainActivity extends Activity {
             start.setOnClickListener(v -> beginTvCapture());
             root.addView(start, buttonParams());
 
-            Button autoBoot = makeButton(autoBootButtonText());
-            autoBoot.setOnClickListener(v -> {
-                boolean enabled = !getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                        .getBoolean(BootReceiver.PREF_AUTO_START_BOOT, false);
-                getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                        .edit()
-                        .putBoolean(BootReceiver.PREF_AUTO_START_BOOT, enabled)
-                        .apply();
-                autoBoot.setText(autoBootButtonText());
-                statusText.setText(enabled
-                        ? "Auto-start enabled. After a reboot, approve Android's capture prompt once."
-                        : "Auto-start on boot disabled.");
-            });
-            root.addView(autoBoot, buttonParams());
 
             testToneButton = makeButton("START TEST CONNECTION TONE");
             testToneButton.setOnClickListener(v -> {
@@ -202,13 +171,6 @@ public class MainActivity extends Activity {
 
         setContentView(scroll);
     }
-
-    private String autoBootButtonText() {
-        boolean enabled = getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                .getBoolean(BootReceiver.PREF_AUTO_START_BOOT, false);
-        return "AUTO-START ON BOOT: " + (enabled ? "ON" : "OFF");
-    }
-
     private LinearLayout.LayoutParams matchWrap() {
         return new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -281,15 +243,6 @@ public class MainActivity extends Activity {
         service.putExtra(CaptureService.EXTRA_RESULT_DATA, data);
         startForegroundService(service);
         statusText.setText("Starting TV audio capture…");
-
-        if (bootAutoStartLaunch) {
-            statusText.postDelayed(() -> {
-                try {
-                    moveTaskToBack(true);
-                } catch (Exception ignored) {
-                }
-            }, 900);
-        }
     }
 
     private void startDiscovery() {

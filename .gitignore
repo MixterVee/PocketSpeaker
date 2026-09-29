@@ -7,3 +7,8 @@ app/build/
 captures/
 .externalNativeBuild/
 .cxx/
+
+# PocketSpeaker release signing
+signing/pocketspeaker-release.p12
+*.jks
+*.keystore

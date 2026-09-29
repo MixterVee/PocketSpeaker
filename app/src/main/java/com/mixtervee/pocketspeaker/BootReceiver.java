@@ -1,11 +1,15 @@
 package com.mixtervee.pocketspeaker;
 
+import android.app.AlarmManager;
+import android.app.PendingIntent;
 import android.app.UiModeManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.os.Build;
+import android.os.SystemClock;
 
 public class BootReceiver extends BroadcastReceiver {
     static final String PREFS = "pocket_speaker";
@@ -24,17 +28,38 @@ public class BootReceiver extends BroadcastReceiver {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putBoolean(PREF_BOOT_START_PENDING, true).apply();
 
-        // Best-effort launch. Android still requires the user to approve the
-        // MediaProjection consent dialog for the new capture session.
+        // Direct activity launches from BOOT_COMPLETED are commonly blocked on
+        // modern Android TV / Google TV. Hand the launch to AlarmManager after the
+        // launcher has had time to settle. Android will still require the normal
+        // MediaProjection approval.
         try {
             Intent launch = new Intent(context, MainActivity.class);
-            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             launch.putExtra(EXTRA_BOOT_AUTO_START, true);
-            context.startActivity(launch);
+
+            PendingIntent pending = PendingIntent.getActivity(
+                    context,
+                    7001,
+                    launch,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+            AlarmManager alarm =
+                    (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarm != null) {
+                long when = SystemClock.elapsedRealtime() + 12000L;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarm.setAndAllowWhileIdle(
+                            AlarmManager.ELAPSED_REALTIME_WAKEUP, when, pending);
+                } else {
+                    alarm.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, when, pending);
+                }
+            }
         } catch (Exception ignored) {
-            // Some Android/Google TV builds may block background activity launches.
-            // Opening Pocket Speaker manually will still auto-request capture while
-            // this preference is enabled.
+            // If this TV firmware blocks even the delayed system launch, the pending
+            // flag remains set so manually opening Pocket Speaker goes straight to
+            // the capture approval prompt.
         }
     }
 

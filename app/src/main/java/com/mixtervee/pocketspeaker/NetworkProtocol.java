@@ -18,6 +18,7 @@ final class NetworkProtocol {
     static final String SENDER_PREFIX = "PS1|SENDER|";
     static final String CONNECT_PREFIX = "PS2|CONNECT|";
     static final String RESYNC_PREFIX = "PS2|RESYNC|";
+    static final String RENAME_PREFIX = "PS2|RENAME|";
 
     private NetworkProtocol() {}
 

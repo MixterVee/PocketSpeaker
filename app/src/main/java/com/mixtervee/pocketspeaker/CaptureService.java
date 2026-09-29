@@ -41,7 +41,7 @@ public class CaptureService extends Service {
     private static final int NOTIFICATION_ID = 100;
 
     private static final byte[] FLUSH_MARKER = new byte[0];
-    private final ArrayBlockingQueue<byte[]> audioQueue = new ArrayBlockingQueue<>(10);
+    private final ArrayBlockingQueue<byte[]> audioQueue = new ArrayBlockingQueue<>(24);
     private volatile boolean running;
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
@@ -195,40 +195,54 @@ public class CaptureService extends Service {
     private void startThreads() {
         captureThread = new Thread(() -> {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
-            byte[] buffer = new byte[Math.max(960, (sampleRate / 100) * channelCount * 2)];
-            long lastReadAt = 0L;
+            byte[] buffer = new byte[Math.max(1920, (sampleRate / 50) * channelCount * 2)];
+            long toneDeadlineNs = System.nanoTime();
 
             while (running) {
                 try {
                     int read;
-                    long beforeRead = System.currentTimeMillis();
+                    boolean toneNow = testTone;
+                    long readStartedAt = System.currentTimeMillis();
 
-                    if (testTone) {
+                    if (toneNow) {
                         read = fillTestTone(buffer);
-                        long frames = read / (2L * channelCount);
-                        long sleepMs = Math.max(1L, (frames * 1000L) / sampleRate);
-                        Thread.sleep(sleepMs);
                     } else {
+                        toneDeadlineNs = System.nanoTime();
                         read = audioRecord.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
                     }
 
-                    long now = System.currentTimeMillis();
+                    long readFinishedAt = System.currentTimeMillis();
 
-                    // A decoder seek/restart can stall playback capture.  When that happens,
-                    // tell the phone to throw away any PCM it still has queued.
-                    if (!testTone && lastReadAt != 0L && beforeRead - lastReadAt > 140L) {
+                    // A seek/restart can make AudioRecord itself block for a noticeable period.
+                    // Flush stale phone PCM only when that real capture stall happens.
+                    if (!toneNow && readFinishedAt - readStartedAt > 140L) {
                         requestResync();
                     }
-                    lastReadAt = now;
 
                     if (read > 0 && clientOut != null) {
                         byte[] copy = Arrays.copyOf(buffer, read);
                         if (!audioQueue.offer(copy)) {
-                            // A full queue means we're becoming audibly late. Catch up once,
-                            // rather than continuously dropping chunks and producing little gaps.
+                            // Only drop when we are badly backed up (~half a second).
                             audioQueue.clear();
                             audioQueue.offer(FLUSH_MARKER);
                             audioQueue.offer(copy);
+                        }
+                    }
+
+                    if (toneNow && read > 0) {
+                        // Pace the synthetic tone to an absolute clock. Sleeping a full packet
+                        // duration every loop runs slower than real time and caused the v0.4
+                        // test-tone underruns.
+                        long frames = read / (2L * channelCount);
+                        long packetNs = (frames * 1_000_000_000L) / sampleRate;
+                        toneDeadlineNs += packetNs;
+                        long remainingNs = toneDeadlineNs - System.nanoTime();
+                        if (remainingNs > 0) {
+                            long ms = remainingNs / 1_000_000L;
+                            int ns = (int) (remainingNs % 1_000_000L);
+                            Thread.sleep(ms, ns);
+                        } else if (remainingNs < -packetNs) {
+                            toneDeadlineNs = System.nanoTime();
                         }
                     }
                 } catch (InterruptedException ignored) {
@@ -332,7 +346,7 @@ public class CaptureService extends Service {
         try {
             Socket socket = new Socket();
             socket.setTcpNoDelay(true);
-            socket.setSendBufferSize(16384);
+            socket.setSendBufferSize(65536);
             socket.connect(new InetSocketAddress(ip, port), 4000);
             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
             out.writeInt(NetworkProtocol.STREAM_MAGIC);

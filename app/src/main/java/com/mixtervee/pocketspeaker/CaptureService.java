@@ -301,6 +301,26 @@ public class CaptureService extends Service {
                         byte[] reply = response.getBytes(StandardCharsets.UTF_8);
                         controlSocket.send(new DatagramPacket(
                                 reply, reply.length, packet.getAddress(), packet.getPort()));
+                    } else if (msg.startsWith(NetworkProtocol.RENAME_PREFIX)) {
+                        String name = msg.substring(NetworkProtocol.RENAME_PREFIX.length())
+                                .replace("\n", " ").trim();
+                        if (name.length() > 32) name = name.substring(0, 32).trim();
+
+                        if (name.isEmpty()) {
+                            getSharedPreferences(PREFS, MODE_PRIVATE)
+                                    .edit().remove(PREF_SOURCE_NAME).apply();
+                        } else {
+                            getSharedPreferences(PREFS, MODE_PRIVATE)
+                                    .edit().putString(PREF_SOURCE_NAME, name).apply();
+                        }
+
+                        String savedName = getSourceName(this);
+                        sendStatus("This TV is now named “" + savedName + "”.");
+
+                        String response = NetworkProtocol.SENDER_PREFIX + savedName;
+                        byte[] reply = response.getBytes(StandardCharsets.UTF_8);
+                        controlSocket.send(new DatagramPacket(
+                                reply, reply.length, packet.getAddress(), packet.getPort()));
                     } else if (msg.startsWith(NetworkProtocol.CONNECT_PREFIX)) {
                         String payload = msg.substring(NetworkProtocol.CONNECT_PREFIX.length()).trim();
                         try {

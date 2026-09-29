@@ -179,7 +179,7 @@ public class CaptureService extends Service {
 
                 AudioRecord record = new AudioRecord.Builder()
                         .setAudioFormat(format)
-                        .setBufferSizeInBytes(Math.max(minBuffer, 4096))
+                        .setBufferSizeInBytes(Math.max(minBuffer * 2, 16384))
                         .setAudioPlaybackCaptureConfig(config)
                         .build();
 
@@ -197,7 +197,7 @@ public class CaptureService extends Service {
 
     private void startThreads() {
         captureThread = new Thread(() -> {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
             byte[] buffer = new byte[Math.max(1920, (sampleRate / 50) * channelCount * 2)];
             long toneDeadlineNs = System.nanoTime();
 
@@ -218,7 +218,7 @@ public class CaptureService extends Service {
 
                     // A seek/restart can make AudioRecord itself block for a noticeable period.
                     // Flush stale phone PCM only when that real capture stall happens.
-                    if (!toneNow && readFinishedAt - readStartedAt > 140L) {
+                    if (!toneNow && readFinishedAt - readStartedAt > 300L) {
                         requestResync();
                     }
 
@@ -258,7 +258,7 @@ public class CaptureService extends Service {
         }, "PocketSpeaker-Capture");
 
         writerThread = new Thread(() -> {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
             while (running) {
                 try {
                     byte[] data = audioQueue.poll(100, TimeUnit.MILLISECONDS);

@@ -48,6 +48,9 @@ public class CaptureService extends Service {
     private DatagramSocket controlSocket;
     private Socket clientSocket;
     private volatile DataOutputStream clientOut;
+    private volatile String clientIp;
+    private volatile int clientResyncPort = NetworkProtocol.RESYNC_PORT;
+    private volatile int resyncId;
     private Thread captureThread;
     private Thread writerThread;
     private Thread controlThread;
@@ -222,9 +225,9 @@ public class CaptureService extends Service {
                     if (read > 0 && clientOut != null) {
                         byte[] copy = Arrays.copyOf(buffer, read);
                         if (!audioQueue.offer(copy)) {
-                            // Only drop when we are badly backed up (~half a second).
-                            audioQueue.clear();
-                            audioQueue.offer(FLUSH_MARKER);
+                            // We are badly backed up. Jump the receiver to fresh audio instead
+                            // of letting latency grow toward half a second.
+                            requestResync();
                             audioQueue.offer(copy);
                         }
                     }
@@ -263,6 +266,7 @@ public class CaptureService extends Service {
                     if (data != null && out != null) {
                         if (data == FLUSH_MARKER || data.length == 0) {
                             out.writeInt(-1);
+                            out.writeInt(resyncId);
                             out.flush();
                         } else {
                             out.writeInt(data.length);
@@ -292,10 +296,14 @@ public class CaptureService extends Service {
                         controlSocket.send(new DatagramPacket(
                                 reply, reply.length, packet.getAddress(), packet.getPort()));
                     } else if (msg.startsWith(NetworkProtocol.CONNECT_PREFIX)) {
-                        String portText = msg.substring(NetworkProtocol.CONNECT_PREFIX.length()).trim();
+                        String payload = msg.substring(NetworkProtocol.CONNECT_PREFIX.length()).trim();
                         try {
-                            int port = Integer.parseInt(portText);
-                            connectClient(packet.getAddress().getHostAddress(), port);
+                            String[] parts = payload.split("\\|");
+                            int port = Integer.parseInt(parts[0]);
+                            int resyncPort = parts.length > 1
+                                    ? Integer.parseInt(parts[1])
+                                    : NetworkProtocol.RESYNC_PORT;
+                            connectClient(packet.getAddress().getHostAddress(), port, resyncPort);
                         } catch (Exception ignored) {
                         }
                     }
@@ -315,7 +323,26 @@ public class CaptureService extends Service {
 
     private void requestResync() {
         if (clientOut == null) return;
+
+        int id = ++resyncId;
         audioQueue.clear();
+
+        // Send this separately from the TCP audio stream so it can jump ahead of
+        // stale PCM already buffered by the OS after an Emby seek.
+        String ip = clientIp;
+        if (ip != null) {
+            try (DatagramSocket socket = new DatagramSocket()) {
+                String message = NetworkProtocol.RESYNC_PREFIX + id;
+                byte[] bytes = message.getBytes(StandardCharsets.UTF_8);
+                socket.send(new DatagramPacket(
+                        bytes, bytes.length,
+                        java.net.InetAddress.getByName(ip),
+                        clientResyncPort));
+            } catch (Exception ignored) {
+                // The in-band marker below remains as a fallback.
+            }
+        }
+
         audioQueue.offer(FLUSH_MARKER);
     }
 
@@ -340,7 +367,7 @@ public class CaptureService extends Service {
         return index;
     }
 
-    private synchronized void connectClient(String ip, int port) {
+    private synchronized void connectClient(String ip, int port, int resyncPort) {
         closeClient();
         audioQueue.clear();
         try {
@@ -356,6 +383,9 @@ public class CaptureService extends Service {
             out.flush();
             clientSocket = socket;
             clientOut = out;
+            clientIp = ip;
+            clientResyncPort = resyncPort;
+            resyncId = 0;
             sendStatus("Connected to phone at " + ip + ".");
         } catch (Exception e) {
             closeClient();
@@ -370,6 +400,8 @@ public class CaptureService extends Service {
         } catch (Exception ignored) {
         }
         clientSocket = null;
+        clientIp = null;
+        clientResyncPort = NetworkProtocol.RESYNC_PORT;
         audioQueue.clear();
     }
 

@@ -60,14 +60,14 @@ public class MainActivity extends Activity {
             boolean autoStartEnabled = getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
                     .getBoolean(BootReceiver.PREF_AUTO_START_BOOT, false);
             boolean pendingBootStart = getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                    .getBoolean("boot_start_pending", false);
+                    .getBoolean(BootReceiver.PREF_BOOT_START_PENDING, false);
             bootAutoStartLaunch = autoStartEnabled &&
                     (getIntent().getBooleanExtra(BootReceiver.EXTRA_BOOT_AUTO_START, false)
                             || pendingBootStart);
 
             if (bootAutoStartLaunch) {
                 getSharedPreferences(BootReceiver.PREFS, MODE_PRIVATE)
-                        .edit().putBoolean("boot_start_pending", false).apply();
+                        .edit().putBoolean(BootReceiver.PREF_BOOT_START_PENDING, false).apply();
                 statusText.setText("Auto-start: waiting for Android capture approval…");
                 statusText.postDelayed(this::beginTvCapture, 1200);
             }

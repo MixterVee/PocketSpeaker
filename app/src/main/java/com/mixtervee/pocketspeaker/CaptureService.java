@@ -225,7 +225,16 @@ public class CaptureService extends Service {
                         read = fillTestTone(buffer);
                     } else {
                         toneDeadlineNs = System.nanoTime();
-                        read = audioRecord.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
+                        int readLength = buffer.length;
+                        if (lowLatencyClient) {
+                            int bytesPerFrame = Math.max(2, channelCount * 2);
+                            readLength = Math.max(bytesPerFrame,
+                                    (sampleRate * bytesPerFrame) / 200); // about 5 ms
+                            readLength -= readLength % bytesPerFrame;
+                        }
+                        read = audioRecord.read(
+                                buffer, 0, Math.min(readLength, buffer.length),
+                                AudioRecord.READ_BLOCKING);
                     }
 
                     long readFinishedAt = System.currentTimeMillis();

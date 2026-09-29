@@ -351,7 +351,7 @@ public class ReceiverService extends Service {
                     final boolean senderWifi = senderTransport == 1;
                     final boolean senderEthernet = senderTransport == 2;
                     final int audioTrackBufferMs =
-                            senderWifi ? 90 : (senderEthernet ? 60 : 75);
+                            senderWifi ? 60 : (senderEthernet ? 40 : 50);
                     transportLabel = senderWifi
                             ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
 
@@ -369,7 +369,7 @@ public class ReceiverService extends Service {
                             .setAudioAttributes(attributes)
                             .setAudioFormat(format)
                             .setBufferSizeInBytes(Math.max(
-                                    minBuffer * 2,
+                                    minBuffer,
                                     (sampleRate * channels * 2 * audioTrackBufferMs) / 1000))
                             .setTransferMode(AudioTrack.MODE_STREAM)
                             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
@@ -414,11 +414,11 @@ public class ReceiverService extends Service {
                     if (!playbackStarted) bufferedBeforePlay += written;
                 }
 
-                int prebufferMs = senderTransport == 1 ? 45
-                        : (senderTransport == 2 ? 25 : 35);
+                int prebufferMs = senderTransport == 1 ? 25
+                        : (senderTransport == 2 ? 12 : 20);
                 int targetPrebufferBytes = Math.max(
                         (sampleRate * channels * 2 * prebufferMs) / 1000,
-                        audioLength * 3);
+                        audioLength * 2);
 
                 if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
                     audioTrack.play();

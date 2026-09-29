@@ -2,6 +2,8 @@ plugins {
     id 'com.android.application'
 }
 
+def signingPassword = System.getenv("POCKETSPEAKER_SIGNING_PASSWORD")
+
 android {
     namespace 'com.mixtervee.pocketspeaker'
     compileSdk 35
@@ -10,13 +12,27 @@ android {
         applicationId 'com.mixtervee.pocketspeaker'
         minSdk 29
         targetSdk 35
-        versionCode 14
-        versionName '0.14.0'
+        versionCode 15
+        versionName '1.0.0'
+    }
+
+    signingConfigs {
+        release {
+            if (signingPassword) {
+                storeFile rootProject.file("signing/pocketspeaker-release.p12")
+                storePassword signingPassword
+                keyAlias 'pocketspeaker'
+                keyPassword signingPassword
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
+            if (signingPassword) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

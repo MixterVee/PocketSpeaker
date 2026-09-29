@@ -39,6 +39,10 @@ public class ReceiverService extends Service {
     private Socket streamSocket;
     private AudioTrack audioTrack;
     private PowerManager.WakeLock wakeLock;
+    private DatagramSocket resyncSocket;
+    private Thread resyncThread;
+    private volatile int requestedResyncId;
+    private volatile int lastMarkerResyncId;
     private volatile int sessionGeneration;
 
     @Override
@@ -78,6 +82,8 @@ public class ReceiverService extends Service {
         int session = ++sessionGeneration;
         stopWorkerOnly();
         running = true;
+        requestedResyncId = 0;
+        lastMarkerResyncId = 0;
 
         PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
         if (powerManager != null) {
@@ -99,13 +105,14 @@ public class ReceiverService extends Service {
             serverSocket.setReuseAddress(true);
             serverSocket.bind(new InetSocketAddress(NetworkProtocol.STREAM_PORT));
             serverSocket.setSoTimeout(10000);
+            startResyncListener();
 
             sendConnectRequest(senderIp);
             sendStatus("Waiting for " + senderName + "…");
 
             streamSocket = serverSocket.accept();
             streamSocket.setTcpNoDelay(true);
-            streamSocket.setReceiveBufferSize(65536);
+            streamSocket.setReceiveBufferSize(16384);
 
             DataInputStream in = new DataInputStream(streamSocket.getInputStream());
             int magic = in.readInt();
@@ -144,8 +151,8 @@ public class ReceiverService extends Service {
                     .setAudioAttributes(attributes)
                     .setAudioFormat(format)
                     .setBufferSizeInBytes(Math.max(
-                            minBuffer * 3,
-                            (sampleRate * channels * 2 * 140) / 1000))
+                            minBuffer * 4,
+                            (sampleRate * channels * 2 * 220) / 1000))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build();
@@ -157,18 +164,23 @@ public class ReceiverService extends Service {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
 
             final int targetPrebufferBytes =
-                    Math.max((sampleRate * channels * 2 * 80) / 1000, 4096);
+                    Math.max((sampleRate * channels * 2 * 120) / 1000, 4096);
             byte[] buffer = new byte[8192];
             int bufferedBeforePlay = 0;
             boolean playbackStarted = false;
+            boolean discardUntilMarker = false;
+            int activeResyncId = 0;
             long lastMeterUpdate = 0L;
 
             while (running) {
                 int packetLength = in.readInt();
 
-                if (packetLength == -1) {
-                    // Sender detected a seek/restart or had to catch up. Drop stale PCM
-                    // already queued in AudioTrack, then build a fresh small safety cushion.
+                // The UDP notice normally arrives before stale TCP audio. Flush immediately
+                // and discard old framed packets until the matching TCP marker catches up.
+                int requested = requestedResyncId;
+                if (requested > activeResyncId) {
+                    activeResyncId = requested;
+                    discardUntilMarker = true;
                     try {
                         if (playbackStarted) audioTrack.pause();
                         audioTrack.flush();
@@ -176,6 +188,27 @@ public class ReceiverService extends Service {
                     }
                     bufferedBeforePlay = 0;
                     playbackStarted = false;
+                }
+
+                if (packetLength == -1) {
+                    int markerId = in.readInt();
+                    lastMarkerResyncId = Math.max(lastMarkerResyncId, markerId);
+
+                    // If the UDP notice was lost, the in-band marker still performs the flush.
+                    if (markerId > activeResyncId) {
+                        activeResyncId = markerId;
+                        try {
+                            if (playbackStarted) audioTrack.pause();
+                            audioTrack.flush();
+                        } catch (Exception ignored) {
+                        }
+                        bufferedBeforePlay = 0;
+                        playbackStarted = false;
+                    }
+
+                    if (markerId >= activeResyncId) {
+                        discardUntilMarker = false;
+                    }
                     continue;
                 }
 
@@ -185,6 +218,10 @@ public class ReceiverService extends Service {
 
                 if (buffer.length < packetLength) buffer = new byte[packetLength];
                 in.readFully(buffer, 0, packetLength);
+
+                if (discardUntilMarker) {
+                    continue;
+                }
 
                 int peak = pcmPeakPercent(buffer, packetLength);
                 long now = System.currentTimeMillis();
@@ -234,8 +271,36 @@ public class ReceiverService extends Service {
         return Math.min(100, Math.round((peak / 32767f) * 100f));
     }
 
+    private void startResyncListener() throws Exception {
+        resyncSocket = new DatagramSocket(NetworkProtocol.RESYNC_PORT);
+        resyncThread = new Thread(() -> {
+            byte[] buffer = new byte[128];
+            while (running) {
+                try {
+                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                    resyncSocket.receive(packet);
+                    String message = new String(
+                            packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
+                    if (message.startsWith(NetworkProtocol.RESYNC_PREFIX)) {
+                        int id = Integer.parseInt(
+                                message.substring(NetworkProtocol.RESYNC_PREFIX.length()).trim());
+                        if (id > lastMarkerResyncId && id > requestedResyncId) {
+                            requestedResyncId = id;
+                        }
+                    }
+                } catch (Exception e) {
+                    if (running && resyncSocket != null && !resyncSocket.isClosed()) {
+                        // Keep TCP fallback alive even if the UDP listener has a transient error.
+                    }
+                }
+            }
+        }, "PocketSpeaker-Resync");
+        resyncThread.start();
+    }
+
     private void sendConnectRequest(String senderIp) throws Exception {
-        String message = NetworkProtocol.CONNECT_PREFIX + NetworkProtocol.STREAM_PORT;
+        String message = NetworkProtocol.CONNECT_PREFIX
+                + NetworkProtocol.STREAM_PORT + "|" + NetworkProtocol.RESYNC_PORT;
         byte[] bytes = message.getBytes(StandardCharsets.UTF_8);
         InetAddress sender = InetAddress.getByName(senderIp);
         try (DatagramSocket socket = new DatagramSocket()) {
@@ -281,6 +346,10 @@ public class ReceiverService extends Service {
 
     private synchronized void stopWorkerOnly() {
         running = false;
+        if (resyncSocket != null) resyncSocket.close();
+        resyncSocket = null;
+        if (resyncThread != null) resyncThread.interrupt();
+        resyncThread = null;
         try {
             if (serverSocket != null) serverSocket.close();
         } catch (Exception ignored) {

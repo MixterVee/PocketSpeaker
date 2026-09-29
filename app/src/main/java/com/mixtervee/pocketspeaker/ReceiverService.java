@@ -119,6 +119,7 @@ public class ReceiverService extends Service {
             int sampleRate = in.readInt();
             int channels = in.readInt();
             int encoding = in.readInt();
+            int senderTransport = in.readInt();
 
             if (magic != NetworkProtocol.STREAM_MAGIC) {
                 throw new IllegalStateException("Unexpected audio stream");
@@ -137,6 +138,12 @@ public class ReceiverService extends Service {
                     sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT);
             if (minBuffer <= 0) throw new IllegalStateException("Audio output unavailable");
 
+            final boolean senderWifi = senderTransport == 1;
+            final boolean senderEthernet = senderTransport == 2;
+            final int targetPrebufferMs = senderWifi ? 220 : (senderEthernet ? 160 : 200);
+            final int audioTrackBufferMs = senderWifi ? 420 : (senderEthernet ? 320 : 380);
+            final String transportLabel = senderWifi ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
+
             AudioAttributes attributes = new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -152,7 +159,7 @@ public class ReceiverService extends Service {
                     .setAudioFormat(format)
                     .setBufferSizeInBytes(Math.max(
                             minBuffer * 4,
-                            (sampleRate * channels * 2 * 320) / 1000))
+                            (sampleRate * channels * 2 * audioTrackBufferMs) / 1000))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build();
@@ -164,7 +171,7 @@ public class ReceiverService extends Service {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
 
             final int targetPrebufferBytes =
-                    Math.max((sampleRate * channels * 2 * 160) / 1000, 4096);
+                    Math.max((sampleRate * channels * 2 * targetPrebufferMs) / 1000, 4096);
             byte[] buffer = new byte[8192];
             int bufferedBeforePlay = 0;
             boolean playbackStarted = false;
@@ -227,7 +234,8 @@ public class ReceiverService extends Service {
                 long now = System.currentTimeMillis();
                 if (now - lastMeterUpdate >= 700L) {
                     int underruns = audioTrack.getUnderrunCount();
-                    sendStatus("Playing " + senderName + " audio • signal " + peak
+                    sendStatus("Playing " + senderName + " audio • " + transportLabel
+                            + " • signal " + peak
                             + "% • underruns " + underruns
                             + " • resyncs " + activeResyncId);
                     lastMeterUpdate = now;

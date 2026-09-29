@@ -237,7 +237,7 @@ public class MainActivity extends Activity {
 
     private boolean isLowLatencyEnabled() {
         return getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
-                .getBoolean("low_latency_mode", false);
+                .getBoolean("low_latency_mode", true);
     }
 
     private void updateLatencyModeButton() {

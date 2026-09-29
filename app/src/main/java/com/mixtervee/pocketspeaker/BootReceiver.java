@@ -10,6 +10,7 @@ import android.content.res.Configuration;
 public class BootReceiver extends BroadcastReceiver {
     static final String PREFS = "pocket_speaker";
     static final String PREF_AUTO_START_BOOT = "auto_start_boot";
+    static final String PREF_BOOT_START_PENDING = "boot_start_pending";
     static final String EXTRA_BOOT_AUTO_START = "boot_auto_start";
 
     @Override
@@ -19,6 +20,9 @@ public class BootReceiver extends BroadcastReceiver {
         boolean enabled = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getBoolean(PREF_AUTO_START_BOOT, false);
         if (!enabled || !isTv(context)) return;
+
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(PREF_BOOT_START_PENDING, true).apply();
 
         // Best-effort launch. Android still requires the user to approve the
         // MediaProjection consent dialog for the new capture session.

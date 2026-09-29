@@ -21,6 +21,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
 public class ReceiverService extends Service {
@@ -29,6 +31,7 @@ public class ReceiverService extends Service {
     static final String ACTION_STATUS = "com.mixtervee.pocketspeaker.RECEIVER_STATUS";
     static final String EXTRA_SENDER_IP = "senderIp";
     static final String EXTRA_SENDER_NAME = "senderName";
+    static final String EXTRA_LOW_LATENCY = "lowLatency";
 
     private static final String CHANNEL_ID = "pocket_speaker_receiver";
     private static final int NOTIFICATION_ID = 101;
@@ -37,6 +40,7 @@ public class ReceiverService extends Service {
     private Thread workerThread;
     private ServerSocket serverSocket;
     private Socket streamSocket;
+    private DatagramSocket udpAudioSocket;
     private AudioTrack audioTrack;
     private PowerManager.WakeLock wakeLock;
     private DatagramSocket resyncSocket;
@@ -64,6 +68,7 @@ public class ReceiverService extends Service {
 
         String senderIp = intent.getStringExtra(EXTRA_SENDER_IP);
         String senderName = intent.getStringExtra(EXTRA_SENDER_NAME);
+        boolean lowLatency = intent.getBooleanExtra(EXTRA_LOW_LATENCY, false);
         if (senderIp == null || senderIp.trim().isEmpty()) {
             sendStatus("No TV address was supplied.");
             stopSelf();
@@ -93,8 +98,14 @@ public class ReceiverService extends Service {
         }
 
         final String finalSenderName = senderName;
-        workerThread = new Thread(() -> runReceiver(senderIp, finalSenderName, session),
-                "PocketSpeaker-Receiver");
+        final boolean finalLowLatency = lowLatency;
+        workerThread = new Thread(() -> {
+            if (finalLowLatency) {
+                runLowLatencyReceiver(senderIp, finalSenderName, session);
+            } else {
+                runReceiver(senderIp, finalSenderName, session);
+            }
+        }, "PocketSpeaker-Receiver");
         workerThread.start();
         return START_NOT_STICKY;
     }
@@ -107,8 +118,8 @@ public class ReceiverService extends Service {
             serverSocket.setSoTimeout(10000);
             startResyncListener();
 
-            sendConnectRequest(senderIp);
-            sendStatus("Waiting for " + senderName + "…");
+            sendConnectRequest(senderIp, false);
+            sendStatus("Waiting for " + senderName + " • STABLE TCP…");
 
             streamSocket = serverSocket.accept();
             streamSocket.setTcpNoDelay(true);
@@ -267,12 +278,193 @@ public class ReceiverService extends Service {
         }
     }
 
+    private void runLowLatencyReceiver(String senderIp, String senderName, int session) {
+        int packetLoss = 0;
+        int lastSequence = -1;
+        int activeResyncId = 0;
+        int bufferedBeforePlay = 0;
+        boolean playbackStarted = false;
+        long lastMeterUpdate = 0L;
+        String transportLabel = "Network";
+
+        try {
+            udpAudioSocket = new DatagramSocket(NetworkProtocol.UDP_AUDIO_PORT);
+            udpAudioSocket.setReceiveBufferSize(16384);
+            udpAudioSocket.setSoTimeout(10000);
+            startResyncListener();
+
+            sendConnectRequest(senderIp, true);
+            sendStatus("Waiting for " + senderName + " • LOW LATENCY UDP…");
+
+            byte[] packetBuffer = new byte[1600];
+
+            while (running) {
+                DatagramPacket datagram = new DatagramPacket(packetBuffer, packetBuffer.length);
+                udpAudioSocket.receive(datagram);
+
+                if (datagram.getLength() <= 28) continue;
+
+                ByteBuffer packet = ByteBuffer.wrap(
+                                datagram.getData(), 0, datagram.getLength())
+                        .order(ByteOrder.BIG_ENDIAN);
+
+                int magic = packet.getInt();
+                if (magic != NetworkProtocol.UDP_AUDIO_MAGIC) continue;
+
+                int sequence = packet.getInt();
+                int packetResyncId = packet.getInt();
+                int sampleRate = packet.getInt();
+                int channels = packet.getInt();
+                int encoding = packet.getInt();
+                int senderTransport = packet.getInt();
+
+                if (encoding != AudioFormat.ENCODING_PCM_16BIT) continue;
+                if (channels != 1 && channels != 2) continue;
+
+                int requested = requestedResyncId;
+                if (packetResyncId < requested) {
+                    continue;
+                }
+
+                if (packetResyncId > activeResyncId || requested > activeResyncId) {
+                    activeResyncId = Math.max(packetResyncId, requested);
+                    try {
+                        if (playbackStarted && audioTrack != null) audioTrack.pause();
+                        if (audioTrack != null) audioTrack.flush();
+                    } catch (Exception ignored) {
+                    }
+                    bufferedBeforePlay = 0;
+                    playbackStarted = false;
+                    lastSequence = sequence - 1;
+                }
+
+                if (audioTrack == null) {
+                    int channelMask = channels == 2
+                            ? AudioFormat.CHANNEL_OUT_STEREO
+                            : AudioFormat.CHANNEL_OUT_MONO;
+                    int minBuffer = AudioTrack.getMinBufferSize(
+                            sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT);
+                    if (minBuffer <= 0) {
+                        throw new IllegalStateException("Audio output unavailable");
+                    }
+
+                    final boolean senderWifi = senderTransport == 1;
+                    final boolean senderEthernet = senderTransport == 2;
+                    final int audioTrackBufferMs =
+                            senderWifi ? 90 : (senderEthernet ? 60 : 75);
+                    transportLabel = senderWifi
+                            ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
+
+                    AudioAttributes attributes = new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build();
+                    AudioFormat format = new AudioFormat.Builder()
+                            .setSampleRate(sampleRate)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(channelMask)
+                            .build();
+
+                    audioTrack = new AudioTrack.Builder()
+                            .setAudioAttributes(attributes)
+                            .setAudioFormat(format)
+                            .setBufferSizeInBytes(Math.max(
+                                    minBuffer * 2,
+                                    (sampleRate * channels * 2 * audioTrackBufferMs) / 1000))
+                            .setTransferMode(AudioTrack.MODE_STREAM)
+                            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                            .build();
+
+                    if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+                        throw new IllegalStateException("Could not initialize phone speaker");
+                    }
+
+                    android.os.Process.setThreadPriority(
+                            android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
+                }
+
+                if (lastSequence >= 0) {
+                    int expected = lastSequence + 1;
+                    if (sequence < expected) {
+                        continue;
+                    }
+                    if (sequence > expected) {
+                        packetLoss += sequence - expected;
+                    }
+                }
+                lastSequence = sequence;
+
+                int audioOffset = 28;
+                int audioLength = datagram.getLength() - audioOffset;
+                if (audioLength <= 0) continue;
+
+                int peak = pcmPeakPercent(datagram.getData(), audioOffset, audioLength);
+
+                int writtenOffset = 0;
+                while (running && writtenOffset < audioLength) {
+                    int written = audioTrack.write(
+                            datagram.getData(),
+                            audioOffset + writtenOffset,
+                            audioLength - writtenOffset,
+                            AudioTrack.WRITE_BLOCKING);
+                    if (written < 0) {
+                        throw new IllegalStateException("Phone audio output failed");
+                    }
+                    writtenOffset += written;
+                    if (!playbackStarted) bufferedBeforePlay += written;
+                }
+
+                int prebufferMs = senderTransport == 1 ? 45
+                        : (senderTransport == 2 ? 25 : 35);
+                int targetPrebufferBytes = Math.max(
+                        (sampleRate * channels * 2 * prebufferMs) / 1000,
+                        audioLength * 3);
+
+                if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
+                    audioTrack.play();
+                    playbackStarted = true;
+                    sendStatus("Playing " + senderName + " • LOW LATENCY UDP.");
+                }
+
+                long now = System.currentTimeMillis();
+                if (now - lastMeterUpdate >= 700L) {
+                    int underruns = audioTrack.getUnderrunCount();
+                    sendStatus("Playing " + senderName + " • LOW LATENCY UDP • "
+                            + transportLabel + " • signal " + peak
+                            + "% • lost " + packetLoss
+                            + " • underruns " + underruns
+                            + " • resyncs " + activeResyncId);
+                    lastMeterUpdate = now;
+                }
+            }
+
+            if (running && session == sessionGeneration) {
+                sendStatus(senderName + " disconnected.");
+            }
+        } catch (java.net.SocketTimeoutException e) {
+            if (running && session == sessionGeneration) {
+                sendStatus("No low latency audio arrived. Try STABLE TCP mode.");
+            }
+        } catch (Exception e) {
+            if (running && session == sessionGeneration) {
+                sendStatus("Low latency connection stopped: " + safeMessage(e));
+            }
+        } finally {
+            if (session == sessionGeneration) stopSelf();
+        }
+    }
+
     private int pcmPeakPercent(byte[] data, int length) {
+        return pcmPeakPercent(data, 0, length);
+    }
+
+    private int pcmPeakPercent(byte[] data, int offset, int length) {
         int peak = 0;
         int usable = length - (length % 2);
         for (int i = 0; i < usable; i += 2) {
-            int lo = data[i] & 0xff;
-            int hi = data[i + 1];
+            int index = offset + i;
+            int lo = data[index] & 0xff;
+            int hi = data[index + 1];
             short sample = (short) ((hi << 8) | lo);
             int value = Math.abs((int) sample);
             if (value > peak) peak = value;
@@ -307,9 +499,11 @@ public class ReceiverService extends Service {
         resyncThread.start();
     }
 
-    private void sendConnectRequest(String senderIp) throws Exception {
+    private void sendConnectRequest(String senderIp, boolean lowLatency) throws Exception {
         String message = NetworkProtocol.CONNECT_PREFIX
-                + NetworkProtocol.STREAM_PORT + "|" + NetworkProtocol.RESYNC_PORT;
+                + NetworkProtocol.STREAM_PORT + "|" + NetworkProtocol.RESYNC_PORT
+                + "|" + NetworkProtocol.UDP_AUDIO_PORT
+                + "|" + (lowLatency ? "UDP" : "TCP");
         byte[] bytes = message.getBytes(StandardCharsets.UTF_8);
         InetAddress sender = InetAddress.getByName(senderIp);
         try (DatagramSocket socket = new DatagramSocket()) {
@@ -367,6 +561,8 @@ public class ReceiverService extends Service {
             if (streamSocket != null) streamSocket.close();
         } catch (Exception ignored) {
         }
+        if (udpAudioSocket != null) udpAudioSocket.close();
+        udpAudioSocket = null;
         serverSocket = null;
         streamSocket = null;
 

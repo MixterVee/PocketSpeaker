@@ -373,7 +373,7 @@ public class CaptureService extends Service {
         try {
             Socket socket = new Socket();
             socket.setTcpNoDelay(true);
-            socket.setSendBufferSize(65536);
+            socket.setSendBufferSize(16384);
             socket.connect(new InetSocketAddress(ip, port), 4000);
             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
             out.writeInt(NetworkProtocol.STREAM_MAGIC);

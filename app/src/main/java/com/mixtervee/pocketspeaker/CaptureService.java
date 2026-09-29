@@ -452,6 +452,7 @@ public class CaptureService extends Service {
         Intent intent = new Intent(ACTION_STATUS);
         intent.setPackage(getPackageName());
         intent.putExtra("status", status);
+        intent.putExtra("testTone", testTone);
         sendBroadcast(intent);
     }
 

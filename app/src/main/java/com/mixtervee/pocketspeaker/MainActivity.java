@@ -34,6 +34,7 @@ public class MainActivity extends Activity {
 
     private boolean isTv;
     private TextView statusText;
+    private Button testToneButton;
     private LinearLayout deviceList;
     private volatile boolean discovering;
     private boolean bootAutoStartLaunch;
@@ -46,6 +47,12 @@ public class MainActivity extends Activity {
         public void onReceive(Context context, Intent intent) {
             String status = intent.getStringExtra("status");
             if (status != null && statusText != null) statusText.setText(status);
+            if (isTv && testToneButton != null && intent.hasExtra("testTone")) {
+                boolean active = intent.getBooleanExtra("testTone", false);
+                testToneButton.setText(active
+                        ? "STOP CONNECTION TONE"
+                        : "START TEST CONNECTION TONE");
+            }
         }
     };
 
@@ -164,13 +171,13 @@ public class MainActivity extends Activity {
             });
             root.addView(autoBoot, buttonParams());
 
-            Button testTone = makeButton("TEST CONNECTION TONE");
-            testTone.setOnClickListener(v -> {
+            testToneButton = makeButton("START TEST CONNECTION TONE");
+            testToneButton.setOnClickListener(v -> {
                 Intent intent = new Intent(this, CaptureService.class);
                 intent.setAction(CaptureService.ACTION_TOGGLE_TEST_TONE);
                 startService(intent);
             });
-            root.addView(testTone, buttonParams());
+            root.addView(testToneButton, buttonParams());
 
             Button stop = makeButton("STOP");
             stop.setOnClickListener(v -> {

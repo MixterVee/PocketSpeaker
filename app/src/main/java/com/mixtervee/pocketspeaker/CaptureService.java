@@ -14,6 +14,9 @@ import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -367,6 +370,23 @@ public class CaptureService extends Service {
         return index;
     }
 
+    private int getSenderTransport() {
+        try {
+            ConnectivityManager manager =
+                    (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (manager == null) return 0;
+            Network network = manager.getActiveNetwork();
+            if (network == null) return 0;
+            NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+            if (capabilities == null) return 0;
+
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return 2;
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return 1;
+        } catch (Exception ignored) {
+        }
+        return 0;
+    }
+
     private synchronized void connectClient(String ip, int port, int resyncPort) {
         closeClient();
         audioQueue.clear();
@@ -380,6 +400,7 @@ public class CaptureService extends Service {
             out.writeInt(sampleRate);
             out.writeInt(channelCount);
             out.writeInt(AudioFormat.ENCODING_PCM_16BIT);
+            out.writeInt(getSenderTransport());
             out.flush();
             clientSocket = socket;
             clientOut = out;

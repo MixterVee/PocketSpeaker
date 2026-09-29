@@ -11,11 +11,13 @@ import java.util.List;
 final class NetworkProtocol {
     static final int CONTROL_PORT = 50005;
     static final int STREAM_PORT = 50008;
-    static final int STREAM_MAGIC = 0x50534B32; // "PSK2" - framed audio protocol
+    static final int RESYNC_PORT = 50006;
+    static final int STREAM_MAGIC = 0x50534B33; // "PSK3" - framed audio + out-of-band resync
 
     static final String DISCOVER = "PS1|DISCOVER";
     static final String SENDER_PREFIX = "PS1|SENDER|";
-    static final String CONNECT_PREFIX = "PS1|CONNECT|";
+    static final String CONNECT_PREFIX = "PS2|CONNECT|";
+    static final String RESYNC_PREFIX = "PS2|RESYNC|";
 
     private NetworkProtocol() {}
 

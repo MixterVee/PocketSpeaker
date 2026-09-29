@@ -2,6 +2,7 @@ package com.mixtervee.pocketspeaker;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.UiModeManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -17,6 +18,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -139,6 +141,9 @@ public class MainActivity extends Activity {
             start.setOnClickListener(v -> beginTvCapture());
             root.addView(start, buttonParams());
 
+            Button rename = makeButton("RENAME THIS TV");
+            rename.setOnClickListener(v -> showRenameDialog());
+            root.addView(rename, buttonParams());
 
             testToneButton = makeButton("START TEST CONNECTION TONE");
             testToneButton.setOnClickListener(v -> {
@@ -171,6 +176,51 @@ public class MainActivity extends Activity {
 
         setContentView(scroll);
     }
+    private void showRenameDialog() {
+        String current = CaptureService.getSourceName(this);
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setText(current);
+        input.setSelectAllOnFocus(true);
+        input.setHint(Build.MODEL);
+        input.setPadding(dp(18), dp(12), dp(18), dp(12));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Rename this TV")
+                .setMessage("This is the name that will appear on your phone.")
+                .setView(input)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", null)
+                .create();
+
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(v -> {
+                    String name = input.getText() == null
+                            ? "" : input.getText().toString().replace("\n", " ").trim();
+                    if (name.length() > 32) name = name.substring(0, 32).trim();
+
+                    if (name.isEmpty()) {
+                        getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                                .edit().remove(CaptureService.PREF_SOURCE_NAME).apply();
+                        name = Build.MODEL;
+                    } else {
+                        getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                                .edit().putString(CaptureService.PREF_SOURCE_NAME, name).apply();
+                    }
+
+                    statusText.setText("This TV is now named “" + name + "”.");
+                    dialog.dismiss();
+                }));
+
+        dialog.getWindow();
+        dialog.show();
+        input.requestFocus();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setSoftInputMode(
+                    WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+        }
+    }
+
     private LinearLayout.LayoutParams matchWrap() {
         return new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -308,14 +358,31 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> {
             if (deviceButtons.containsKey(ip)) return;
             statusText.setText("TV found. Tap it to listen.");
-            Button button = makeButton(name + "   •   " + ip);
+
+            String lastIp = getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                    .getString("last_source_ip", "");
+            boolean isLast = ip.equals(lastIp);
+            String label = (isLast ? "LAST • " : "") + name + "   •   " + ip;
+
+            Button button = makeButton(label);
             button.setOnClickListener(v -> connectToSender(name, ip));
             deviceButtons.put(ip, button);
-            deviceList.addView(button, buttonParams());
+
+            if (isLast) {
+                deviceList.addView(button, 0, buttonParams());
+            } else {
+                deviceList.addView(button, buttonParams());
+            }
         });
     }
 
     private void connectToSender(String name, String ip) {
+        getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
+                .edit()
+                .putString("last_source_ip", ip)
+                .putString("last_source_name", name)
+                .apply();
+
         Intent intent = new Intent(this, ReceiverService.class);
         intent.setAction(ReceiverService.ACTION_CONNECT);
         intent.putExtra(ReceiverService.EXTRA_SENDER_IP, ip);

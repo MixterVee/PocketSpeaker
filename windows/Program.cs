@@ -4,6 +4,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 
 namespace PocketSpeaker.Windows;
 

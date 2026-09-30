@@ -21,6 +21,24 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
+      - name: Create temporary Windows icon
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 256,256
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::FromArgb(24,28,34))
+          $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(81,196,133))
+          $g.FillEllipse($brush,28,28,200,200)
+          $font = New-Object System.Drawing.Font("Segoe UI",72,[System.Drawing.FontStyle]::Bold)
+          $g.DrawString("PS",$font,[System.Drawing.Brushes]::White,43,72)
+          $ico = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+          $fs = [System.IO.File]::Create("windows/app.ico")
+          $ico.Save($fs)
+          $fs.Close()
+          $g.Dispose()
+          $bmp.Dispose()
+
       - name: Publish Windows sender
         shell: pwsh
         run: dotnet publish windows/PocketSpeaker.Windows.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o out

@@ -1,0 +1,32 @@
+name: Build Pocket Speaker Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "windows/**"
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish Windows sender
+        shell: pwsh
+        run: dotnet publish windows/PocketSpeaker.Windows.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o out
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketSpeaker-Windows-x64
+          path: out/*

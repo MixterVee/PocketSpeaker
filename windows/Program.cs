@@ -39,6 +39,12 @@ internal sealed class Sender : IDisposable
     private int sequence;
     private int resyncId;
     private bool running;
+    private int captureSampleRate = 48000;
+    private int captureChannels = 2;
+    private int captureBits = 32;
+    private WaveFormatEncoding captureEncoding = WaveFormatEncoding.IeeeFloat;
+    private long packetsSent;
+    private bool firstAudioReported;
     public string SourceName { get; private set; } = Environment.MachineName;
 
     public Sender(Action<string> status) => this.status = status;
@@ -55,12 +61,28 @@ internal sealed class Sender : IDisposable
     private void StartCapture()
     {
         capture = new WasapiLoopbackCapture();
+        captureSampleRate = capture.WaveFormat.SampleRate;
+        captureChannels = Math.Max(1, capture.WaveFormat.Channels);
+        captureBits = capture.WaveFormat.BitsPerSample;
+        captureEncoding = capture.WaveFormat.Encoding;
+
         capture.DataAvailable += (_, e) =>
         {
             try
             {
-                if (phone is null) return;
-                SendCaptured(e.Buffer, e.BytesRecorded, capture.WaveFormat);
+                if (phone is null || e.BytesRecorded <= 0) return;
+                byte[] pcm = ConvertToPcm16(e.Buffer, e.BytesRecorded, capture.WaveFormat);
+                if (pcm.Length == 0) return;
+
+                if (lowLatency) SendUdp(pcm);
+                else SendTcp(pcm);
+
+                if (!firstAudioReported)
+                {
+                    firstAudioReported = true;
+                    status($"Audio streaming • {captureSampleRate} Hz • {Math.Min(captureChannels, 2)} ch • " +
+                           (lowLatency ? "LOW LATENCY UDP" : "STABLE TCP"));
+                }
             }
             catch (Exception ex)
             {
@@ -72,6 +94,67 @@ internal sealed class Sender : IDisposable
             if (e.Exception != null) status("Capture stopped: " + e.Exception.Message);
         };
         capture.StartRecording();
+        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch.");
+    }
+
+    private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)
+    {
+        int sourceChannels = Math.Max(1, fmt.Channels);
+        int outputChannels = Math.Min(sourceChannels, 2);
+        int bytesPerSample = Math.Max(1, fmt.BitsPerSample / 8);
+        int bytesPerFrame = bytesPerSample * sourceChannels;
+        if (bytesPerFrame <= 0) return Array.Empty<byte>();
+
+        int frames = count / bytesPerFrame;
+        if (frames <= 0) return Array.Empty<byte>();
+
+        byte[] output = new byte[frames * outputChannels * 2];
+        int outIndex = 0;
+
+        bool float32 = fmt.BitsPerSample == 32 &&
+                       (fmt.Encoding == WaveFormatEncoding.IeeeFloat ||
+                        fmt.Encoding == WaveFormatEncoding.Extensible);
+
+        for (int frame = 0; frame < frames; frame++)
+        {
+            int frameBase = frame * bytesPerFrame;
+            for (int ch = 0; ch < outputChannels; ch++)
+            {
+                int p = frameBase + ch * bytesPerSample;
+                short sample;
+
+                if (float32)
+                {
+                    float v = BitConverter.ToSingle(input, p);
+                    if (float.IsNaN(v) || float.IsInfinity(v)) v = 0;
+                    v = Math.Clamp(v, -1f, 1f);
+                    sample = (short)Math.Clamp((int)(v * 32767f), short.MinValue, short.MaxValue);
+                }
+                else if (fmt.BitsPerSample == 16)
+                {
+                    sample = (short)(input[p] | (input[p + 1] << 8));
+                }
+                else if (fmt.BitsPerSample == 24)
+                {
+                    int v = input[p] | (input[p + 1] << 8) | (input[p + 2] << 16);
+                    if ((v & 0x800000) != 0) v |= unchecked((int)0xff000000);
+                    sample = (short)(v >> 8);
+                }
+                else if (fmt.BitsPerSample == 32)
+                {
+                    int v = BitConverter.ToInt32(input, p);
+                    sample = (short)(v >> 16);
+                }
+                else
+                {
+                    sample = 0;
+                }
+
+                output[outIndex++] = (byte)(sample & 0xff);
+                output[outIndex++] = (byte)((sample >> 8) & 0xff);
+            }
+        }
+        return output;
     }
 
     private async Task ControlLoop()
@@ -110,6 +193,8 @@ internal sealed class Sender : IDisposable
                 phone = new IPEndPoint(r.RemoteEndPoint.Address, lowLatency ? phoneAudioPort : streamPort);
                 sequence = 0;
                 resyncId = 0;
+                firstAudioReported = false;
+                packetsSent = 0;
                 if (lowLatency)
                 {
                     tcp?.Dispose();
@@ -137,39 +222,12 @@ internal sealed class Sender : IDisposable
         tcpStream = tcp.GetStream();
         phone = new IPEndPoint(ip, port);
         WriteInt32(tcpStream, Protocol.StreamMagic);
-        WriteInt32(tcpStream, 48000);
-        WriteInt32(tcpStream, 2);
+        WriteInt32(tcpStream, captureSampleRate);
+        WriteInt32(tcpStream, Math.Min(captureChannels, 2));
         WriteInt32(tcpStream, 2);
         WriteInt32(tcpStream, SenderTransport());
         await tcpStream.FlushAsync();
         status($"Connected to phone at {ip} • STABLE TCP.");
-    }
-
-    private void SendCaptured(byte[] buffer, int count, WaveFormat fmt)
-    {
-        // Android expects signed 16-bit little-endian PCM. NAudio loopback is usually IEEE float,
-        // so convert here and always transmit 48 kHz stereo for the first test build.
-        var provider = new BufferedWaveProvider(fmt) { DiscardOnBufferOverflow = true };
-        provider.AddSamples(buffer, 0, count);
-        ISampleProvider samples = provider.ToSampleProvider();
-        if (fmt.SampleRate != 48000) samples = new WdlResamplingSampleProvider(samples, 48000);
-        if (samples.WaveFormat.Channels == 1) samples = new MonoToStereoSampleProvider(samples);
-        if (samples.WaveFormat.Channels > 2) samples = new StereoSampleProvider(samples);
-
-        float[] floats = new float[480 * 2];
-        int n;
-        while ((n = samples.Read(floats, 0, floats.Length)) > 0)
-        {
-            byte[] pcm = new byte[n * 2];
-            for (int i = 0; i < n; i++)
-            {
-                short s = (short)Math.Clamp((int)(floats[i] * 32767f), short.MinValue, short.MaxValue);
-                pcm[i * 2] = (byte)(s & 0xff);
-                pcm[i * 2 + 1] = (byte)((s >> 8) & 0xff);
-            }
-            if (lowLatency) SendUdp(pcm);
-            else SendTcp(pcm);
-        }
     }
 
     private void SendUdp(byte[] pcm)
@@ -178,22 +236,26 @@ internal sealed class Sender : IDisposable
         var sock = udp;
         if (target is null || sock is null) return;
         const int header = 28;
-        const int payload = 960; // 5 ms at 48 kHz stereo 16-bit
+        int channels = Math.Min(captureChannels, 2);
+        int bytesPerFrame = Math.Max(2, channels * 2);
+        int payload = Math.Max(bytesPerFrame, (captureSampleRate * bytesPerFrame) / 200); // ~5 ms
+        payload -= payload % bytesPerFrame;
         for (int off = 0; off < pcm.Length;)
         {
             int len = Math.Min(payload, pcm.Length - off);
-            len -= len % 4;
+            len -= len % bytesPerFrame;
             if (len <= 0) break;
             byte[] packet = new byte[header + len];
             BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(0, 4), Protocol.UdpAudioMagic);
             BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(4, 4), ++sequence);
             BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(8, 4), resyncId);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(12, 4), 48000);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(16, 4), 2);
+            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(12, 4), captureSampleRate);
+            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(16, 4), channels);
             BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(20, 4), 2);
             BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(24, 4), SenderTransport());
             Buffer.BlockCopy(pcm, off, packet, header, len);
             sock.Send(packet, packet.Length, new IPEndPoint(target.Address, phoneAudioPort));
+            packetsSent++;
             off += len;
         }
     }

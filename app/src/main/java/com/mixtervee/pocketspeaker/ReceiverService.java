@@ -312,11 +312,11 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 19 latency-only pass: keep the proven 50 + 35 ms fallback,
-        // but after six consecutive clean UDP packets reduce the healthy-path cushion
-        // from 15 ms to 5 ms. Transport and recovery behavior stay unchanged.
+        // Beta 20 latency-only pass: keep the proven 50 + 35 ms fallback,
+        // but after six consecutive clean UDP packets remove the final 5 ms healthy-path
+        // cushion. Transport, recovery, prebuffer, and AudioTrack behavior stay unchanged.
         final int fallbackCushionMs = 50;
-        final int adaptiveCushionMs = 5;
+        final int adaptiveCushionMs = 0;
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
         int cleanStartupPackets = 0;

@@ -312,9 +312,8 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 20 latency-only pass: keep the proven 50 + 35 ms fallback,
-        // but after six consecutive clean UDP packets remove the final 5 ms healthy-path
-        // cushion. Transport, recovery, prebuffer, and AudioTrack behavior stay unchanged.
+        // Beta 21: keep Beta 20's proven UDP startup/recovery behavior unchanged.
+        // This pass targets only AudioTrack queue capacity to reduce steady-state latency.
         final int fallbackCushionMs = 50;
         final int adaptiveCushionMs = 0;
         final int fallbackStartupGuardMs = 35;
@@ -424,7 +423,7 @@ public class ReceiverService extends Service {
                     // A larger AudioTrack does not itself add delay; it leaves room for
                     // the fixed receive reserve and brief Android scheduling jitter.
                     final int audioTrackBufferMs =
-                            senderWifi ? 180 : (senderEthernet ? 150 : 165);
+                            senderWifi ? 150 : (senderEthernet ? 120 : 135);
                     transportLabel = senderWifi
                             ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
 

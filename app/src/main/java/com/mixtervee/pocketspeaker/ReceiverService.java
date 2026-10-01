@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
@@ -43,6 +44,7 @@ public class ReceiverService extends Service {
     private DatagramSocket udpAudioSocket;
     private AudioTrack audioTrack;
     private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
     private DatagramSocket resyncSocket;
     private Thread resyncThread;
     private volatile int requestedResyncId;
@@ -97,10 +99,35 @@ public class ReceiverService extends Service {
             wakeLock.acquire();
         }
 
+        // Beta 12: low-latency UDP depends on the phone receiving packets on time.
+        // A CPU wake lock alone does not stop Wi-Fi power saving from briefly batching
+        // traffic. Android's low-latency Wi-Fi lock asks the radio/driver to favor
+        // interactive delivery while this foreground receiver is active.
+        if (lowLatency) {
+            try {
+                WifiManager wifiManager =
+                        (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+                if (wifiManager != null) {
+                    wifiLock = wifiManager.createWifiLock(
+                            WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                            "PocketSpeaker:LowLatency");
+                    wifiLock.setReferenceCounted(false);
+                    wifiLock.acquire();
+                }
+            } catch (Exception ignored) {
+                // Keep streaming even on devices that do not honor this lock.
+                wifiLock = null;
+            }
+        }
+
         final String finalSenderName = senderName;
         final boolean finalLowLatency = lowLatency;
         workerThread = new Thread(() -> {
             if (finalLowLatency) {
+                // Apply audio priority before the first UDP receive, not only after
+                // AudioTrack creation, so the whole receive/write loop gets priority.
+                android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
                 runLowLatencyReceiver(senderIp, finalSenderName, session);
             } else {
                 runReceiver(senderIp, finalSenderName, session);
@@ -692,6 +719,9 @@ public class ReceiverService extends Service {
 
         if (workerThread != null) workerThread.interrupt();
         workerThread = null;
+
+        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        wifiLock = null;
 
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         wakeLock = null;

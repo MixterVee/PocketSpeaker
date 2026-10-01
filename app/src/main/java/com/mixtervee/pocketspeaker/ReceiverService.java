@@ -285,10 +285,13 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
+        // Keep a small permanent safety margin, then add temporary cushion only
+        // when the phone actually underruns. The permanent 20 ms is intentionally
+        // modest so UDP still feels low-latency.
+        final int baselineCushionMs = 20;
+        final int maxAdaptiveExtraMs = 60;
         int adaptiveExtraMs = 0;
         int lastUnderrunCount = 0;
-        int recentUnderruns = 0;
-        long underrunWindowStarted = 0L;
         int lastReportedPacketLoss = 0;
         long lastTroubleAt = 0L;
         long lastCushionDecayAt = 0L;
@@ -379,10 +382,11 @@ public class ReceiverService extends Service {
 
                     final boolean senderWifi = senderTransport == 1;
                     final boolean senderEthernet = senderTransport == 2;
-                    // Restore a modest safety margin. This is still far below TCP mode,
-                    // but gives UDP enough room to survive short scheduler/network stalls.
+                    // Capacity is deliberately larger than the normal latency target.
+                    // A larger AudioTrack does not itself add delay; it simply gives the
+                    // adaptive rebuffer room to grow to 80 ms of safety cushion.
                     final int audioTrackBufferMs =
-                            senderWifi ? 90 : (senderEthernet ? 60 : 75);
+                            senderWifi ? 180 : (senderEthernet ? 150 : 165);
                     transportLabel = senderWifi
                             ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
 
@@ -448,7 +452,8 @@ public class ReceiverService extends Service {
                 int prebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
                 int targetPrebufferBytes = Math.max(
-                        (sampleRate * channels * 2 * (prebufferMs + adaptiveExtraMs)) / 1000,
+                        (sampleRate * channels * 2
+                                * (prebufferMs + baselineCushionMs + adaptiveExtraMs)) / 1000,
                         audioLength * 2);
 
                 if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
@@ -461,37 +466,33 @@ public class ReceiverService extends Service {
                 if (now - lastMeterUpdate >= 700L) {
                     int underruns = audioTrack.getUnderrunCount();
 
-                    if (underrunWindowStarted != 0L
-                            && now - underrunWindowStarted > 30000L) {
-                        recentUnderruns = 0;
-                        underrunWindowStarted = 0L;
-                    }
-
                     int newLoss = packetLoss - lastReportedPacketLoss;
                     lastReportedPacketLoss = packetLoss;
 
+                    int newUnderruns = 0;
                     if (underruns > lastUnderrunCount) {
-                        int newUnderruns = underruns - lastUnderrunCount;
+                        newUnderruns = underruns - lastUnderrunCount;
                         lastUnderrunCount = underruns;
-
-                        if (underrunWindowStarted == 0L) {
-                            underrunWindowStarted = now;
-                        }
-                        recentUnderruns += newUnderruns;
                     }
 
-                    // A burst of missing packets or repeated underruns means the current
-                    // low-latency cushion has been exhausted. Recover decisively instead
-                    // of creeping upward 5 ms at a time while the listener keeps breaking up.
-                    boolean burstTrouble = newLoss >= 8 || recentUnderruns >= 2;
-                    if (burstTrouble) {
-                        adaptiveExtraMs = Math.min(50, Math.max(30, adaptiveExtraMs + 15));
-                        recentUnderruns = 0;
-                        underrunWindowStarted = now;
+                    // Any real AudioTrack starvation is now enough to raise the target
+                    // cushion. Step up 20 ms at a time (faster if several underruns were
+                    // observed together), but cap the temporary portion at 60 ms. Together
+                    // with the permanent 20 ms baseline this tops out at +80 ms.
+                    boolean trouble = newUnderruns > 0 || newLoss >= 8;
+                    if (trouble) {
+                        int stepMs = newUnderruns > 0
+                                ? 20 * Math.min(newUnderruns, 3)
+                                : 20;
+                        int previousExtraMs = adaptiveExtraMs;
+                        adaptiveExtraMs = Math.min(
+                                maxAdaptiveExtraMs, adaptiveExtraMs + stepMs);
                         lastTroubleAt = now;
                         lastCushionDecayAt = now;
 
-                        if (playbackStarted) {
+                        // Rebuffer only when the target actually grew. Once we reach the
+                        // cap, repeated underrun counters must not create repeated flushes.
+                        if (adaptiveExtraMs > previousExtraMs && playbackStarted) {
                             try {
                                 audioTrack.pause();
                                 audioTrack.flush();
@@ -502,17 +503,17 @@ public class ReceiverService extends Service {
                         }
                     } else if (adaptiveExtraMs > 0
                             && lastTroubleAt != 0L
-                            && now - lastTroubleAt >= 20000L
-                            && now - lastCushionDecayAt >= 10000L) {
-                        // Once the stream has been clean for a while, give latency back
-                        // gradually. Do not flush just to shrink the safety margin.
-                        adaptiveExtraMs = Math.max(0, adaptiveExtraMs - 5);
+                            && now - lastTroubleAt >= 45000L
+                            && now - lastCushionDecayAt >= 20000L) {
+                        // After a long clean stretch, lower the temporary target slowly.
+                        // The permanent 20 ms safety cushion is never removed.
+                        adaptiveExtraMs = Math.max(0, adaptiveExtraMs - 10);
                         lastCushionDecayAt = now;
                     }
 
                     sendStatus("UDP " + transportLabel
                             + " • signal " + peak + "%"
-                            + " • cushion +" + adaptiveExtraMs + " ms\n"
+                            + " • cushion +" + (baselineCushionMs + adaptiveExtraMs) + " ms\n"
                             + "Lost " + packetLoss
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);

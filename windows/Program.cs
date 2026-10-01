@@ -313,15 +313,13 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Beta 14 latency guard: never let the Windows pacing queue become a hidden
-        // delay reservoir. Beta 13 could carry almost 30 x ~7 ms packets before
-        // trimming, which made a scheduling stall audible as extra latency long
-        // after Windows had recovered. Keep at most ~85 ms queued and, if that
-        // ceiling is crossed, discard oldest audio down to ~40 ms so the stream
-        // catches up immediately instead of faithfully playing stale PCM.
-        if (Volatile.Read(ref udpQueuedPackets) > 12)
+        // Beta 15 fine-latency guard: Beta 14 proved stable, so tighten only the
+        // sender's stale-audio ceiling. At ~7 ms per packet, cap the pacing queue
+        // near 55 ms and trim back to ~28 ms after a scheduling stall. Capture,
+        // packet size, pacing, and the Android receiver remain unchanged.
+        if (Volatile.Read(ref udpQueuedPackets) > 8)
         {
-            while (Volatile.Read(ref udpQueuedPackets) > 6 && udpQueue.TryDequeue(out _))
+            while (Volatile.Read(ref udpQueuedPackets) > 4 && udpQueue.TryDequeue(out _))
                 Interlocked.Decrement(ref udpQueuedPackets);
         }
 

@@ -285,11 +285,15 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 10 adds only 15 ms to Beta 9's fixed reserve. The recording showed
-        // isolated ~60-125 ms starvation events, so this gives AudioTrack a little
-        // more scheduling protection without bringing back the old pause/flush
-        // recovery or materially changing the low-latency character.
+        // Keep Beta 10's 50 ms reserve unchanged. Beta 11 adds bounded packet-loss
+        // concealment only when a short UDP sequence gap arrives before AudioTrack
+        // has actually underrun. This fills the missing timeline from the last good
+        // PCM packet instead of raising normal latency or pause/flush rebuffering.
         final int baselineCushionMs = 50;
+        int lastObservedUnderruns = 0;
+        int recoveredPackets = 0;
+        byte[] previousAudioPacket = null;
+        int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
         String transportLabel = "Network";
 
@@ -363,6 +367,8 @@ public class ReceiverService extends Service {
                     bufferedBeforePlay = 0;
                     playbackStarted = false;
                     lastSequence = sequence - 1;
+                    previousAudioPacket = null;
+                    previousAudioLength = 0;
                 }
 
                 if (audioTrack == null) {
@@ -413,13 +419,15 @@ public class ReceiverService extends Service {
                             android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
                 }
 
+                int missingPackets = 0;
                 if (lastSequence >= 0) {
                     int expected = lastSequence + 1;
                     if (sequence < expected) {
                         continue;
                     }
                     if (sequence > expected) {
-                        packetLoss += sequence - expected;
+                        missingPackets = sequence - expected;
+                        packetLoss += missingPackets;
                     }
                 }
                 lastSequence = sequence;
@@ -429,6 +437,61 @@ public class ReceiverService extends Service {
                 if (audioLength <= 0) continue;
 
                 int peak = pcmPeakPercent(datagram.getData(), audioOffset, audioLength);
+
+                // Beta 11 short-gap recovery: if UDP packets went missing but the
+                // AudioTrack reserve has not yet starved, preserve that missing time
+                // with a gently fading copy of the last good PCM packet. Cap recovery
+                // at roughly 60 ms so a long outage never turns into a long repeated
+                // sound. If AudioTrack already underrun, do not add delayed audio.
+                int currentUnderruns = audioTrack.getUnderrunCount();
+                boolean alreadyStarved =
+                        playbackStarted && currentUnderruns > lastObservedUnderruns;
+                lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
+
+                if (playbackStarted
+                        && missingPackets > 0
+                        && !alreadyStarved
+                        && previousAudioPacket != null
+                        && previousAudioLength > 0) {
+                    int bytesPerMs = Math.max(1, (sampleRate * channels * 2) / 1000);
+                    int previousPacketMs = Math.max(1, previousAudioLength / bytesPerMs);
+                    int maxRecoveryPackets = Math.max(1, 60 / previousPacketMs);
+                    int packetsToRecover = Math.min(missingPackets, maxRecoveryPackets);
+                    byte[] concealed = new byte[previousAudioLength];
+
+                    for (int recoveryIndex = 0;
+                         recoveryIndex < packetsToRecover && running;
+                         recoveryIndex++) {
+                        // Start close to full level and fade each repeated packet.
+                        int gainPercent = Math.max(20, 90 - (recoveryIndex * 15));
+                        int usable = previousAudioLength - (previousAudioLength % 2);
+                        for (int i = 0; i < usable; i += 2) {
+                            int sample = (short) ((previousAudioPacket[i] & 0xff)
+                                    | (previousAudioPacket[i + 1] << 8));
+                            int scaled = (sample * gainPercent) / 100;
+                            concealed[i] = (byte) (scaled & 0xff);
+                            concealed[i + 1] = (byte) ((scaled >> 8) & 0xff);
+                        }
+                        if (usable < previousAudioLength) {
+                            concealed[previousAudioLength - 1] =
+                                    previousAudioPacket[previousAudioLength - 1];
+                        }
+
+                        int concealOffset = 0;
+                        while (running && concealOffset < previousAudioLength) {
+                            int written = audioTrack.write(
+                                    concealed,
+                                    concealOffset,
+                                    previousAudioLength - concealOffset,
+                                    AudioTrack.WRITE_BLOCKING);
+                            if (written < 0) {
+                                throw new IllegalStateException("Phone audio output failed");
+                            }
+                            concealOffset += written;
+                        }
+                    }
+                    recoveredPackets += packetsToRecover;
+                }
 
                 int writtenOffset = 0;
                 while (running && writtenOffset < audioLength) {
@@ -443,6 +506,18 @@ public class ReceiverService extends Service {
                     writtenOffset += written;
                     if (!playbackStarted) bufferedBeforePlay += written;
                 }
+
+                if (previousAudioPacket == null
+                        || previousAudioPacket.length < audioLength) {
+                    previousAudioPacket = new byte[audioLength];
+                }
+                System.arraycopy(
+                        datagram.getData(),
+                        audioOffset,
+                        previousAudioPacket,
+                        0,
+                        audioLength);
+                previousAudioLength = audioLength;
 
                 int prebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
@@ -460,15 +535,17 @@ public class ReceiverService extends Service {
                 long now = System.currentTimeMillis();
                 if (now - lastMeterUpdate >= 700L) {
                     int underruns = audioTrack.getUnderrunCount();
+                    lastObservedUnderruns = Math.max(lastObservedUnderruns, underruns);
 
-                    // Beta 10 deliberately does not pause/flush here. Keep playing
-                    // through brief loss bursts and let the fixed reserve absorb them.
-                    // Explicit sender resyncs still use the normal flush path above.
+                    // No pause/flush recovery here. The fixed reserve handles scheduler
+                    // jitter; Beta 11 only conceals bounded UDP sequence gaps that are
+                    // caught before the AudioTrack itself starves.
 
                     sendStatus("UDP " + transportLabel
                             + " • signal " + peak + "%"
                             + " • cushion +" + baselineCushionMs + " ms\n"
                             + "Lost " + packetLoss
+                            + " • Recovered " + recoveredPackets
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;

@@ -77,7 +77,7 @@ internal sealed class Sender : IDisposable
         capture = new WasapiRecorderBuilder()
             .WithLoopbackCapture()
             .WithEventSync()
-            .WithBufferLength(5)
+            .WithBufferLength(8)
             .WithMmcssThreadPriority("Pro Audio")
             .Build();
 
@@ -104,7 +104,7 @@ internal sealed class Sender : IDisposable
                     int callbackMs = Math.Max(1, (pcm.Length * 1000) /
                         Math.Max(1, captureSampleRate * Math.Min(captureChannels, 2) * 2));
                     status($"Audio streaming • {captureSampleRate} Hz • {Math.Min(captureChannels, 2)} ch • " +
-                           (lowLatency ? $"LOW LATENCY UDP • capture chunk {callbackMs} ms • 5 ms packets" : "STABLE TCP"));
+                           (lowLatency ? $"LOW LATENCY UDP • capture chunk {callbackMs} ms • 7 ms packets" : "STABLE TCP"));
                 }
             }
             catch (Exception ex)
@@ -119,7 +119,7 @@ internal sealed class Sender : IDisposable
         };
 
         capture.StartRecording();
-        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 5 ms WASAPI buffer.");
+        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 8 ms WASAPI buffer.");
     }
 
     private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)
@@ -279,10 +279,9 @@ internal sealed class Sender : IDisposable
     {
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
-        // Beta 23 sender latency pass: use ~5 ms UDP packets to reduce packetization delay.
-        // Keep the absolute-deadline pacing and all receiver/recovery behavior unchanged.
+        // Beta 24: keep Beta 22's proven ~7 ms UDP packetization; only the WASAPI capture buffer is being tested lower.
         int desiredPayload = Math.Max(bytesPerFrame,
-            (captureSampleRate * bytesPerFrame * 5) / 1000); // target about 5 ms
+            (captureSampleRate * bytesPerFrame * 7) / 1000); // target about 7 ms
         int payload = Math.Min(1400, desiredPayload);
         payload -= payload % bytesPerFrame;
         if (payload <= 0) return;
@@ -312,11 +311,10 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Preserve Beta 22's stale-audio safety window in time, not packet count:
-        // ~85 ms ceiling and trim to ~40 ms after a genuine scheduling stall.
-        if (Volatile.Read(ref udpQueuedPackets) > 17)
+        // Beta 22 queue behavior: ~85 ms ceiling, trimming back to ~40 ms only after a genuine scheduling stall.
+        if (Volatile.Read(ref udpQueuedPackets) > 12)
         {
-            while (Volatile.Read(ref udpQueuedPackets) > 8 && udpQueue.TryDequeue(out _))
+            while (Volatile.Read(ref udpQueuedPackets) > 6 && udpQueue.TryDequeue(out _))
                 Interlocked.Decrement(ref udpQueuedPackets);
         }
 

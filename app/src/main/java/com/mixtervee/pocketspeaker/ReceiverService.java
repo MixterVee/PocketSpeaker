@@ -312,11 +312,11 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 18 conservative latency pass: keep the proven 50 + 35 ms fallback,
-        // but after six consecutive clean UDP packets trim only 10 ms from Beta 17's
-        // healthy-path startup reserve. Transport and recovery behavior stay unchanged.
+        // Beta 19 latency-only pass: keep the proven 50 + 35 ms fallback,
+        // but after six consecutive clean UDP packets reduce the healthy-path cushion
+        // from 15 ms to 5 ms. Transport and recovery behavior stay unchanged.
         final int fallbackCushionMs = 50;
-        final int adaptiveCushionMs = 15;
+        final int adaptiveCushionMs = 5;
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
         int cleanStartupPackets = 0;

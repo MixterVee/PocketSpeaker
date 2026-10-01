@@ -104,7 +104,7 @@ internal sealed class Sender : IDisposable
                     int callbackMs = Math.Max(1, (pcm.Length * 1000) /
                         Math.Max(1, captureSampleRate * Math.Min(captureChannels, 2) * 2));
                     status($"Audio streaming • {captureSampleRate} Hz • {Math.Min(captureChannels, 2)} ch • " +
-                           (lowLatency ? $"LOW LATENCY UDP • capture chunk {callbackMs} ms • smooth pacing" : "STABLE TCP"));
+                           (lowLatency ? $"LOW LATENCY UDP • capture chunk {callbackMs} ms • 7 ms packets" : "STABLE TCP"));
                 }
             }
             catch (Exception ex)
@@ -279,12 +279,12 @@ internal sealed class Sender : IDisposable
     {
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
-        // Keep the Windows sender on the same ~5 ms packet size used by the
-        // Android sender. The previous 7 ms experiment made UDP startup unstable
-        // on the phone and could drive AudioTrack into continuous underruns.
+        // Use ~7 ms packets now that pacing is fixed. This lowers packet rate by
+        // roughly 30% versus 5 ms packets while still keeping each datagram safely
+        // below the phone receiver's packet buffer.
         int desiredPayload = Math.Max(bytesPerFrame,
-            (captureSampleRate * bytesPerFrame) / 200); // target about 5 ms
-        int payload = Math.Min(1400, desiredPayload);   // packet + 28-byte header stays < 1600
+            (captureSampleRate * bytesPerFrame * 7) / 1000); // target about 7 ms
+        int payload = Math.Min(1400, desiredPayload);
         payload -= payload % bytesPerFrame;
         if (payload <= 0) return;
 

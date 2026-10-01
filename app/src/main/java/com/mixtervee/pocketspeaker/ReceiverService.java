@@ -312,8 +312,8 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 21: keep Beta 20's proven UDP startup/recovery behavior unchanged.
-        // This pass targets only AudioTrack queue capacity to reduce steady-state latency.
+        // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
+        // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
         final int fallbackCushionMs = 50;
         final int adaptiveCushionMs = 0;
         final int fallbackStartupGuardMs = 35;
@@ -423,13 +423,14 @@ public class ReceiverService extends Service {
                     // A larger AudioTrack does not itself add delay; it leaves room for
                     // the fixed receive reserve and brief Android scheduling jitter.
                     final int audioTrackBufferMs =
-                            senderWifi ? 150 : (senderEthernet ? 120 : 135);
+                            senderWifi ? 180 : (senderEthernet ? 150 : 165);
                     transportLabel = senderWifi
                             ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
 
                     AudioAttributes attributes = new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_MEDIA)
                             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
                             .build();
                     AudioFormat format = new AudioFormat.Builder()
                             .setSampleRate(sampleRate)

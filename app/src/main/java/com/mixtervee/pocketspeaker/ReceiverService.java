@@ -293,14 +293,17 @@ public class ReceiverService extends Service {
 
         try {
             udpAudioSocket = new DatagramSocket(NetworkProtocol.UDP_AUDIO_PORT);
-            udpAudioSocket.setReceiveBufferSize(16384);
+            // Keep the network receive queue large enough to absorb brief Android
+            // scheduling stalls while AudioTrack is busy. The old 16 KB socket buffer
+            // only held a small fraction of a second of PCM and could overflow quickly.
+            udpAudioSocket.setReceiveBufferSize(262144);
             udpAudioSocket.setSoTimeout(10000);
             startResyncListener();
 
             sendConnectRequest(senderIp, true);
             sendStatus("Waiting for " + senderName + " • LOW LATENCY UDP…");
 
-            byte[] packetBuffer = new byte[1600];
+            byte[] packetBuffer = new byte[2048];
 
             while (running) {
                 DatagramPacket datagram = new DatagramPacket(packetBuffer, packetBuffer.length);
@@ -354,8 +357,10 @@ public class ReceiverService extends Service {
 
                     final boolean senderWifi = senderTransport == 1;
                     final boolean senderEthernet = senderTransport == 2;
+                    // Restore a modest safety margin. This is still far below TCP mode,
+                    // but gives UDP enough room to survive short scheduler/network stalls.
                     final int audioTrackBufferMs =
-                            senderWifi ? 65 : (senderEthernet ? 45 : 55);
+                            senderWifi ? 90 : (senderEthernet ? 60 : 75);
                     transportLabel = senderWifi
                             ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
 
@@ -418,8 +423,8 @@ public class ReceiverService extends Service {
                     if (!playbackStarted) bufferedBeforePlay += written;
                 }
 
-                int prebufferMs = senderTransport == 1 ? 30
-                        : (senderTransport == 2 ? 17 : 25);
+                int prebufferMs = senderTransport == 1 ? 45
+                        : (senderTransport == 2 ? 25 : 35);
                 int targetPrebufferBytes = Math.max(
                         (sampleRate * channels * 2 * (prebufferMs + adaptiveExtraMs)) / 1000,
                         audioLength * 2);
@@ -456,12 +461,14 @@ public class ReceiverService extends Service {
                             recentUnderruns = 0;
                             underrunWindowStarted = now;
 
-                            // Pause briefly and rebuild the new cushion without flushing
-                            // already-received audio. This avoids permanently increasing
-                            // latency unless the connection actually proves it needs it.
+                            // Rebuild the cushion from a known-empty AudioTrack. The old
+                            // code paused without flushing, so writes could block against
+                            // audio already sitting in the paused track and the UDP receive
+                            // loop could stall permanently.
                             if (playbackStarted) {
                                 try {
                                     audioTrack.pause();
+                                    audioTrack.flush();
                                 } catch (Exception ignored) {
                                 }
                                 playbackStarted = false;

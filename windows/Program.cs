@@ -279,9 +279,12 @@ internal sealed class Sender : IDisposable
     {
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
+        // Keep the Windows sender on the same ~5 ms packet size used by the
+        // Android sender. The previous 7 ms experiment made UDP startup unstable
+        // on the phone and could drive AudioTrack into continuous underruns.
         int desiredPayload = Math.Max(bytesPerFrame,
-            (captureSampleRate * bytesPerFrame * 7) / 1000); // target about 7 ms
-        int payload = Math.Min(1400, desiredPayload);       // stays below phone's 1600-byte receive buffer
+            (captureSampleRate * bytesPerFrame) / 200); // target about 5 ms
+        int payload = Math.Min(1400, desiredPayload);   // packet + 28-byte header stays < 1600
         payload -= payload % bytesPerFrame;
         if (payload <= 0) return;
 
@@ -310,11 +313,11 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Emergency guard only. Normal clock drift is handled by the pacing servo below,
-        // so we no longer repeatedly chop the queue and create audible "catch-up" breakups.
-        if (Volatile.Read(ref udpQueuedPackets) > 45)
+        // Emergency guard only. If Windows is ever badly delayed, discard old
+        // queued audio rather than letting sender-side latency grow without bound.
+        if (Volatile.Read(ref udpQueuedPackets) > 30)
         {
-            while (Volatile.Read(ref udpQueuedPackets) > 14 && udpQueue.TryDequeue(out _))
+            while (Volatile.Read(ref udpQueuedPackets) > 12 && udpQueue.TryDequeue(out _))
                 Interlocked.Decrement(ref udpQueuedPackets);
         }
 
@@ -346,29 +349,19 @@ internal sealed class Sender : IDisposable
 
             int channels = Math.Min(captureChannels, 2);
             int bytesPerSecond = Math.Max(1, captureSampleRate * channels * 2);
-            double packetSeconds = chunk.Length / (double)bytesPerSecond;
-
-            // Tiny servo to follow the capture device's real clock rather than assuming its
-            // nominal 48 kHz clock is identical to Stopwatch and the phone's audio clock.
-            int depth = Volatile.Read(ref udpQueuedPackets);
-            double paceFactor = depth switch
-            {
-                >= 18 => 0.975,  // drain a backlog gently
-                >= 10 => 0.988,
-                >= 6  => 0.995,
-                0     => 1.004,  // avoid starving the phone when nearly empty
-                _     => 1.000
-            };
             long packetTicks = Math.Max(1,
-                (long)(frequency * packetSeconds * paceFactor));
+                (long)(frequency * (chunk.Length / (double)bytesPerSecond)));
 
             long now = Stopwatch.GetTimestamp();
             if (next == 0)
                 next = now;
 
-            // Never "catch up" by blasting several packets after a Windows scheduling stall.
-            // That was overflowing the phone's UDP receive queue and showing up as LOST packets.
-            if (now - next > packetTicks)
+            // Pace against an absolute deadline. The previous build scheduled the
+            // next packet from "now" after every send; tiny scheduler/send overhead
+            // accumulated on every packet and starved the phone continuously.
+            // If Windows is genuinely late by more than two packet periods, reset
+            // once instead of blasting a catch-up burst.
+            if (now - next > packetTicks * 2)
                 next = now;
 
             while (running)
@@ -395,7 +388,7 @@ internal sealed class Sender : IDisposable
                 status("UDP send error: " + ex.Message);
             }
 
-            next = Stopwatch.GetTimestamp() + packetTicks;
+            next += packetTicks;
         }
     }
 

@@ -285,16 +285,11 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Keep a small permanent safety margin, then add temporary cushion only
-        // when the phone actually underruns. The permanent 20 ms is intentionally
-        // modest so UDP still feels low-latency.
-        final int baselineCushionMs = 20;
-        final int maxAdaptiveExtraMs = 60;
-        int adaptiveExtraMs = 0;
-        int lastUnderrunCount = 0;
-        int lastReportedPacketLoss = 0;
-        long lastTroubleAt = 0L;
-        long lastCushionDecayAt = 0L;
+        // Beta 9 keeps a modest fixed reserve instead of Beta 8's hard
+        // pause/flush/rebuffer recovery. That recovery could turn one brief
+        // scheduling hiccup into an audible ~100-120 ms hole of its own.
+        // +35 ms is only 15 ms more than Beta 8's normal reserve.
+        final int baselineCushionMs = 35;
         boolean receivedFirstAudio = false;
         String transportLabel = "Network";
 
@@ -383,8 +378,8 @@ public class ReceiverService extends Service {
                     final boolean senderWifi = senderTransport == 1;
                     final boolean senderEthernet = senderTransport == 2;
                     // Capacity is deliberately larger than the normal latency target.
-                    // A larger AudioTrack does not itself add delay; it simply gives the
-                    // adaptive rebuffer room to grow to 80 ms of safety cushion.
+                    // A larger AudioTrack does not itself add delay; it leaves room for
+                    // the fixed receive reserve and brief Android scheduling jitter.
                     final int audioTrackBufferMs =
                             senderWifi ? 180 : (senderEthernet ? 150 : 165);
                     transportLabel = senderWifi
@@ -453,7 +448,7 @@ public class ReceiverService extends Service {
                         : (senderTransport == 2 ? 25 : 35);
                 int targetPrebufferBytes = Math.max(
                         (sampleRate * channels * 2
-                                * (prebufferMs + baselineCushionMs + adaptiveExtraMs)) / 1000,
+                                * (prebufferMs + baselineCushionMs)) / 1000,
                         audioLength * 2);
 
                 if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
@@ -466,54 +461,13 @@ public class ReceiverService extends Service {
                 if (now - lastMeterUpdate >= 700L) {
                     int underruns = audioTrack.getUnderrunCount();
 
-                    int newLoss = packetLoss - lastReportedPacketLoss;
-                    lastReportedPacketLoss = packetLoss;
-
-                    int newUnderruns = 0;
-                    if (underruns > lastUnderrunCount) {
-                        newUnderruns = underruns - lastUnderrunCount;
-                        lastUnderrunCount = underruns;
-                    }
-
-                    // Any real AudioTrack starvation is now enough to raise the target
-                    // cushion. Step up 20 ms at a time (faster if several underruns were
-                    // observed together), but cap the temporary portion at 60 ms. Together
-                    // with the permanent 20 ms baseline this tops out at +80 ms.
-                    boolean trouble = newUnderruns > 0 || newLoss >= 8;
-                    if (trouble) {
-                        int stepMs = newUnderruns > 0
-                                ? 20 * Math.min(newUnderruns, 3)
-                                : 20;
-                        int previousExtraMs = adaptiveExtraMs;
-                        adaptiveExtraMs = Math.min(
-                                maxAdaptiveExtraMs, adaptiveExtraMs + stepMs);
-                        lastTroubleAt = now;
-                        lastCushionDecayAt = now;
-
-                        // Rebuffer only when the target actually grew. Once we reach the
-                        // cap, repeated underrun counters must not create repeated flushes.
-                        if (adaptiveExtraMs > previousExtraMs && playbackStarted) {
-                            try {
-                                audioTrack.pause();
-                                audioTrack.flush();
-                            } catch (Exception ignored) {
-                            }
-                            playbackStarted = false;
-                            bufferedBeforePlay = 0;
-                        }
-                    } else if (adaptiveExtraMs > 0
-                            && lastTroubleAt != 0L
-                            && now - lastTroubleAt >= 45000L
-                            && now - lastCushionDecayAt >= 20000L) {
-                        // After a long clean stretch, lower the temporary target slowly.
-                        // The permanent 20 ms safety cushion is never removed.
-                        adaptiveExtraMs = Math.max(0, adaptiveExtraMs - 10);
-                        lastCushionDecayAt = now;
-                    }
+                    // Beta 9 deliberately does not pause/flush here. Keep playing
+                    // through brief loss bursts and let the fixed reserve absorb them.
+                    // Explicit sender resyncs still use the normal flush path above.
 
                     sendStatus("UDP " + transportLabel
                             + " • signal " + peak + "%"
-                            + " • cushion +" + (baselineCushionMs + adaptiveExtraMs) + " ms\n"
+                            + " • cushion +" + baselineCushionMs + " ms\n"
                             + "Lost " + packetLoss
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);

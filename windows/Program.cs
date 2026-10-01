@@ -313,13 +313,13 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Beta 15 fine-latency guard: Beta 14 proved stable, so tighten only the
-        // sender's stale-audio ceiling. At ~7 ms per packet, cap the pacing queue
-        // near 55 ms and trim back to ~28 ms after a scheduling stall. Capture,
-        // packet size, pacing, and the Android receiver remain unchanged.
-        if (Volatile.Read(ref udpQueuedPackets) > 8)
+        // Beta 16 starts from Beta 14's proven sender behavior. Beta 15's tighter
+        // 8 -> 4 packet stale-audio trim sounded worse in real-world testing, so
+        // keep the safer ~85 ms ceiling and trim only after a genuine scheduling
+        // stall, back to roughly ~40 ms.
+        if (Volatile.Read(ref udpQueuedPackets) > 12)
         {
-            while (Volatile.Read(ref udpQueuedPackets) > 4 && udpQueue.TryDequeue(out _))
+            while (Volatile.Read(ref udpQueuedPackets) > 6 && udpQueue.TryDequeue(out _))
                 Interlocked.Decrement(ref udpQueuedPackets);
         }
 

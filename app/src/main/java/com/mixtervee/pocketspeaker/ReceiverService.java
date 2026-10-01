@@ -312,12 +312,17 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Keep Beta 12's proven 50 ms running reserve unchanged. Beta 13 adds only
-        // a small one-time startup guard before the very first play() so Android has
-        // a little more audio ready while its output path settles. Resyncs keep the
-        // normal Beta 12 target so this does not make recovery progressively slower.
-        final int baselineCushionMs = 50;
-        final int initialStartupGuardMs = 35;
+        // Beta 16 adaptive startup: retain the proven 50 + 35 ms fallback,
+        // but after six consecutive clean UDP packets let a healthy connection start
+        // with a smaller 35 + 15 ms reserve. Any early loss immediately falls back.
+        final int fallbackCushionMs = 50;
+        final int adaptiveCushionMs = 35;
+        final int fallbackStartupGuardMs = 35;
+        final int adaptiveStartupGuardMs = 15;
+        int cleanStartupPackets = 0;
+        int selectedCushionMs = fallbackCushionMs;
+        int selectedStartupGuardMs = fallbackStartupGuardMs;
+        long totalFramesWritten = 0L;
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
         byte[] previousAudioPacket = null;
@@ -397,6 +402,10 @@ public class ReceiverService extends Service {
                     lastSequence = sequence - 1;
                     previousAudioPacket = null;
                     previousAudioLength = 0;
+                    cleanStartupPackets = 0;
+                    selectedCushionMs = fallbackCushionMs;
+                    selectedStartupGuardMs = fallbackStartupGuardMs;
+                    totalFramesWritten = 0L;
                 }
 
                 if (audioTrack == null) {
@@ -460,6 +469,20 @@ public class ReceiverService extends Service {
                 }
                 lastSequence = sequence;
 
+                if (!playbackStarted) {
+                    if (missingPackets == 0) {
+                        cleanStartupPackets++;
+                        if (cleanStartupPackets >= 6) {
+                            selectedCushionMs = adaptiveCushionMs;
+                            selectedStartupGuardMs = adaptiveStartupGuardMs;
+                        }
+                    } else {
+                        cleanStartupPackets = 0;
+                        selectedCushionMs = fallbackCushionMs;
+                        selectedStartupGuardMs = fallbackStartupGuardMs;
+                    }
+                }
+
                 int audioOffset = 28;
                 int audioLength = datagram.getLength() - audioOffset;
                 if (audioLength <= 0) continue;
@@ -516,6 +539,7 @@ public class ReceiverService extends Service {
                                 throw new IllegalStateException("Phone audio output failed");
                             }
                             concealOffset += written;
+                            totalFramesWritten += written / Math.max(2, channels * 2);
                         }
                     }
                     recoveredPackets += packetsToRecover;
@@ -532,6 +556,7 @@ public class ReceiverService extends Service {
                         throw new IllegalStateException("Phone audio output failed");
                     }
                     writtenOffset += written;
+                    totalFramesWritten += written / Math.max(2, channels * 2);
                     if (!playbackStarted) bufferedBeforePlay += written;
                 }
 
@@ -550,16 +575,18 @@ public class ReceiverService extends Service {
                 int prebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
                 int startupGuardMs = activeResyncId == 0
-                        ? initialStartupGuardMs : 0;
+                        ? selectedStartupGuardMs : 0;
+                int targetPrebufferMs =
+                        prebufferMs + selectedCushionMs + startupGuardMs;
                 int targetPrebufferBytes = Math.max(
-                        (sampleRate * channels * 2
-                                * (prebufferMs + baselineCushionMs + startupGuardMs)) / 1000,
+                        (sampleRate * channels * 2 * targetPrebufferMs) / 1000,
                         audioLength * 2);
 
                 if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
                     audioTrack.play();
                     playbackStarted = true;
-                    sendStatus("Playing " + senderName + " • LOW LATENCY UDP.");
+                    sendStatus("Playing " + senderName + " • LOW LATENCY UDP"
+                            + " • target " + targetPrebufferMs + " ms.");
                 }
 
                 long now = System.currentTimeMillis();
@@ -571,9 +598,16 @@ public class ReceiverService extends Service {
                     // jitter; Beta 11 only conceals bounded UDP sequence gaps that are
                     // caught before the AudioTrack itself starves.
 
+                    long playedFrames = playbackStarted
+                            ? (audioTrack.getPlaybackHeadPosition() & 0xffffffffL) : 0L;
+                    long queuedFrames = Math.max(0L, totalFramesWritten - playedFrames);
+                    int queuedMs = (int) Math.min(
+                            9999L, (queuedFrames * 1000L) / Math.max(1, sampleRate));
+
                     sendStatus("UDP " + transportLabel
                             + " • signal " + peak + "%"
-                            + " • cushion +" + baselineCushionMs + " ms\n"
+                            + " • cushion +" + selectedCushionMs + " ms"
+                            + " • queue ~" + queuedMs + " ms\n"
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
                             + " • Underruns " + underruns

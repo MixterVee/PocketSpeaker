@@ -289,6 +289,10 @@ public class ReceiverService extends Service {
         int lastUnderrunCount = 0;
         int recentUnderruns = 0;
         long underrunWindowStarted = 0L;
+        int lastReportedPacketLoss = 0;
+        long lastTroubleAt = 0L;
+        long lastCushionDecayAt = 0L;
+        boolean receivedFirstAudio = false;
         String transportLabel = "Network";
 
         try {
@@ -297,7 +301,9 @@ public class ReceiverService extends Service {
             // scheduling stalls while AudioTrack is busy. The old 16 KB socket buffer
             // only held a small fraction of a second of PCM and could overflow quickly.
             udpAudioSocket.setReceiveBufferSize(262144);
-            udpAudioSocket.setSoTimeout(10000);
+            // Before the first audio packet, use a short timeout so a lost CONNECT
+            // datagram is retried automatically instead of requiring another tap.
+            udpAudioSocket.setSoTimeout(700);
             startResyncListener();
 
             sendConnectRequest(senderIp, true);
@@ -307,7 +313,23 @@ public class ReceiverService extends Service {
 
             while (running) {
                 DatagramPacket datagram = new DatagramPacket(packetBuffer, packetBuffer.length);
-                udpAudioSocket.receive(datagram);
+                try {
+                    udpAudioSocket.receive(datagram);
+                } catch (java.net.SocketTimeoutException timeout) {
+                    if (!receivedFirstAudio) {
+                        // CONNECT is UDP too, so it can disappear. Keep asking until the
+                        // sender actually starts delivering audio; one tap should be enough.
+                        sendConnectRequest(senderIp, true);
+                        sendStatus("Connecting to " + senderName + " • retrying automatically…");
+                        continue;
+                    }
+                    throw timeout;
+                }
+
+                if (!receivedFirstAudio) {
+                    receivedFirstAudio = true;
+                    udpAudioSocket.setSoTimeout(10000);
+                }
 
                 if (datagram.getLength() <= 28) continue;
 
@@ -445,6 +467,9 @@ public class ReceiverService extends Service {
                         underrunWindowStarted = 0L;
                     }
 
+                    int newLoss = packetLoss - lastReportedPacketLoss;
+                    lastReportedPacketLoss = packetLoss;
+
                     if (underruns > lastUnderrunCount) {
                         int newUnderruns = underruns - lastUnderrunCount;
                         lastUnderrunCount = underruns;
@@ -453,28 +478,36 @@ public class ReceiverService extends Service {
                             underrunWindowStarted = now;
                         }
                         recentUnderruns += newUnderruns;
+                    }
 
-                        // Two underruns inside 30 seconds means this connection needs
-                        // a little more cushion. Add only 5 ms at a time, up to 15 ms.
-                        if (recentUnderruns >= 2 && adaptiveExtraMs < 15) {
-                            adaptiveExtraMs += 5;
-                            recentUnderruns = 0;
-                            underrunWindowStarted = now;
+                    // A burst of missing packets or repeated underruns means the current
+                    // low-latency cushion has been exhausted. Recover decisively instead
+                    // of creeping upward 5 ms at a time while the listener keeps breaking up.
+                    boolean burstTrouble = newLoss >= 8 || recentUnderruns >= 2;
+                    if (burstTrouble) {
+                        adaptiveExtraMs = Math.min(50, Math.max(30, adaptiveExtraMs + 15));
+                        recentUnderruns = 0;
+                        underrunWindowStarted = now;
+                        lastTroubleAt = now;
+                        lastCushionDecayAt = now;
 
-                            // Rebuild the cushion from a known-empty AudioTrack. The old
-                            // code paused without flushing, so writes could block against
-                            // audio already sitting in the paused track and the UDP receive
-                            // loop could stall permanently.
-                            if (playbackStarted) {
-                                try {
-                                    audioTrack.pause();
-                                    audioTrack.flush();
-                                } catch (Exception ignored) {
-                                }
-                                playbackStarted = false;
-                                bufferedBeforePlay = 0;
+                        if (playbackStarted) {
+                            try {
+                                audioTrack.pause();
+                                audioTrack.flush();
+                            } catch (Exception ignored) {
                             }
+                            playbackStarted = false;
+                            bufferedBeforePlay = 0;
                         }
+                    } else if (adaptiveExtraMs > 0
+                            && lastTroubleAt != 0L
+                            && now - lastTroubleAt >= 20000L
+                            && now - lastCushionDecayAt >= 10000L) {
+                        // Once the stream has been clean for a while, give latency back
+                        // gradually. Do not flush just to shrink the safety margin.
+                        adaptiveExtraMs = Math.max(0, adaptiveExtraMs - 5);
+                        lastCushionDecayAt = now;
                     }
 
                     sendStatus("UDP " + transportLabel

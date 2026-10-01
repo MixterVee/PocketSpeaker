@@ -285,11 +285,11 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 9 keeps a modest fixed reserve instead of Beta 8's hard
-        // pause/flush/rebuffer recovery. That recovery could turn one brief
-        // scheduling hiccup into an audible ~100-120 ms hole of its own.
-        // +35 ms is only 15 ms more than Beta 8's normal reserve.
-        final int baselineCushionMs = 35;
+        // Beta 10 adds only 15 ms to Beta 9's fixed reserve. The recording showed
+        // isolated ~60-125 ms starvation events, so this gives AudioTrack a little
+        // more scheduling protection without bringing back the old pause/flush
+        // recovery or materially changing the low-latency character.
+        final int baselineCushionMs = 50;
         boolean receivedFirstAudio = false;
         String transportLabel = "Network";
 
@@ -461,7 +461,7 @@ public class ReceiverService extends Service {
                 if (now - lastMeterUpdate >= 700L) {
                     int underruns = audioTrack.getUnderrunCount();
 
-                    // Beta 9 deliberately does not pause/flush here. Keep playing
+                    // Beta 10 deliberately does not pause/flush here. Keep playing
                     // through brief loss bursts and let the fixed reserve absorb them.
                     // Explicit sender resyncs still use the normal flush path above.
 

@@ -12,8 +12,8 @@ android {
         applicationId 'com.mixtervee.pocketspeaker'
         minSdk 29
         targetSdk 35
-        versionCode 35
-        versionName '1.1.0-beta22'
+        versionCode 36
+        versionName '1.1.0-beta23'
     }
 
     signingConfigs {

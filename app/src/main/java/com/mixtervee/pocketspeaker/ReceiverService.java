@@ -312,11 +312,12 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Keep Beta 10's 50 ms reserve unchanged. Beta 11 adds bounded packet-loss
-        // concealment only when a short UDP sequence gap arrives before AudioTrack
-        // has actually underrun. This fills the missing timeline from the last good
-        // PCM packet instead of raising normal latency or pause/flush rebuffering.
+        // Keep Beta 12's proven 50 ms running reserve unchanged. Beta 13 adds only
+        // a small one-time startup guard before the very first play() so Android has
+        // a little more audio ready while its output path settles. Resyncs keep the
+        // normal Beta 12 target so this does not make recovery progressively slower.
         final int baselineCushionMs = 50;
+        final int initialStartupGuardMs = 35;
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
         byte[] previousAudioPacket = null;
@@ -548,9 +549,11 @@ public class ReceiverService extends Service {
 
                 int prebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
+                int startupGuardMs = activeResyncId == 0
+                        ? initialStartupGuardMs : 0;
                 int targetPrebufferBytes = Math.max(
                         (sampleRate * channels * 2
-                                * (prebufferMs + baselineCushionMs)) / 1000,
+                                * (prebufferMs + baselineCushionMs + startupGuardMs)) / 1000,
                         audioLength * 2);
 
                 if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {

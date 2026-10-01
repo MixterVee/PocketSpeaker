@@ -77,7 +77,7 @@ internal sealed class Sender : IDisposable
         capture = new WasapiRecorderBuilder()
             .WithLoopbackCapture()
             .WithEventSync()
-            .WithBufferLength(8)
+            .WithBufferLength(9)
             .WithMmcssThreadPriority("Pro Audio")
             .Build();
 
@@ -119,7 +119,7 @@ internal sealed class Sender : IDisposable
         };
 
         capture.StartRecording();
-        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 8 ms WASAPI buffer.");
+        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 9 ms WASAPI buffer.");
     }
 
     private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)
@@ -279,7 +279,9 @@ internal sealed class Sender : IDisposable
     {
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
-        // Beta 24: keep Beta 22's proven ~7 ms UDP packetization; only the WASAPI capture buffer is being tested lower.
+        // Use ~7 ms packets now that pacing is fixed. This lowers packet rate by
+        // roughly 30% versus 5 ms packets while still keeping each datagram safely
+        // below the phone receiver's packet buffer.
         int desiredPayload = Math.Max(bytesPerFrame,
             (captureSampleRate * bytesPerFrame * 7) / 1000); // target about 7 ms
         int payload = Math.Min(1400, desiredPayload);
@@ -311,7 +313,10 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Beta 22 queue behavior: ~85 ms ceiling, trimming back to ~40 ms only after a genuine scheduling stall.
+        // Beta 16 starts from Beta 14's proven sender behavior. Beta 15's tighter
+        // 8 -> 4 packet stale-audio trim sounded worse in real-world testing, so
+        // keep the safer ~85 ms ceiling and trim only after a genuine scheduling
+        // stall, back to roughly ~40 ms.
         if (Volatile.Read(ref udpQueuedPackets) > 12)
         {
             while (Volatile.Read(ref udpQueuedPackets) > 6 && udpQueue.TryDequeue(out _))

@@ -77,7 +77,7 @@ internal sealed class Sender : IDisposable
         capture = new WasapiRecorderBuilder()
             .WithLoopbackCapture()
             .WithEventSync()
-            .WithBufferLength(20)
+            .WithBufferLength(10)
             .WithMmcssThreadPriority("Pro Audio")
             .Build();
 
@@ -119,7 +119,7 @@ internal sealed class Sender : IDisposable
         };
 
         capture.StartRecording();
-        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 20 ms WASAPI buffer.");
+        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 10 ms WASAPI buffer.");
     }
 
     private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)
@@ -313,11 +313,15 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Emergency guard only. If Windows is ever badly delayed, discard old
-        // queued audio rather than letting sender-side latency grow without bound.
-        if (Volatile.Read(ref udpQueuedPackets) > 30)
+        // Beta 14 latency guard: never let the Windows pacing queue become a hidden
+        // delay reservoir. Beta 13 could carry almost 30 x ~7 ms packets before
+        // trimming, which made a scheduling stall audible as extra latency long
+        // after Windows had recovered. Keep at most ~85 ms queued and, if that
+        // ceiling is crossed, discard oldest audio down to ~40 ms so the stream
+        // catches up immediately instead of faithfully playing stale PCM.
+        if (Volatile.Read(ref udpQueuedPackets) > 12)
         {
-            while (Volatile.Read(ref udpQueuedPackets) > 12 && udpQueue.TryDequeue(out _))
+            while (Volatile.Read(ref udpQueuedPackets) > 6 && udpQueue.TryDequeue(out _))
                 Interlocked.Decrement(ref udpQueuedPackets);
         }
 

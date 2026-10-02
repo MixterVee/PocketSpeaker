@@ -324,9 +324,10 @@ public class ReceiverService extends Service {
         long totalFramesWritten = 0L;
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
-        int recoveredUnderruns = 0;
-        boolean underrunRecoveryActive = false;
-        int recoveryTrimCounter = 0;
+        int underrunRecoveryEvents = 0;
+        boolean underrunRecoveryPending = false;
+        boolean underrunCatchUpActive = false;
+        long lastUnderrunAtMs = 0L;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -408,8 +409,9 @@ public class ReceiverService extends Service {
                     selectedCushionMs = fallbackCushionMs;
                     selectedStartupGuardMs = fallbackStartupGuardMs;
                     totalFramesWritten = 0L;
-                    underrunRecoveryActive = false;
-                    recoveryTrimCounter = 0;
+                    underrunRecoveryPending = false;
+                    underrunCatchUpActive = false;
+                    lastUnderrunAtMs = 0L;
                 }
 
                 if (audioTrack == null) {
@@ -503,14 +505,21 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
                 if (alreadyStarved) {
-                    underrunRecoveryActive = true;
-                    recoveryTrimCounter = 0;
+                    // Beta 36: do not immediately "fix" an underrun. First let the
+                    // normal Beta 22 path rebuild a safe queue. If the starvation left
+                    // us permanently late, a single catch-up drain will run only after
+                    // the stream has remained stable for a short period.
+                    lastUnderrunAtMs = System.currentTimeMillis();
+                    underrunRecoveryPending = true;
+                    underrunCatchUpActive = false;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
                 if (playbackStarted
                         && missingPackets > 0
                         && !alreadyStarved
+                        && !underrunRecoveryPending
+                        && !underrunCatchUpActive
                         && previousAudioPacket != null
                         && previousAudioLength > 0) {
                     int bytesPerMs = Math.max(1, (sampleRate * channels * 2) / 1000);
@@ -554,52 +563,66 @@ public class ReceiverService extends Service {
                     recoveredPackets += packetsToRecover;
                 }
 
-                // Beta 35 underrun recovery: an underrun must not establish a new,
-                // permanently-late playback position.  Once AudioTrack reports a real
-                // starvation event, measure the queued audio and gently shed only the
-                // excess above the normal Beta 22 target.  Trim about 0.5 ms every
-                // fourth packet so recovery is gradual and avoids the audible gaps
-                // caused by aggressive catch-up attempts.
-                int recoverySkipBytes = 0;
-                if (playbackStarted && underrunRecoveryActive) {
-                    long playedFramesNow =
-                            audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
-                    long queuedFramesNow =
-                            Math.max(0L, totalFramesWritten - playedFramesNow);
-                    int queuedMsNow = (int) ((queuedFramesNow * 1000L)
-                            / Math.max(1, sampleRate));
-                    int normalTargetMs = senderTransport == 1 ? 45
-                            : (senderTransport == 2 ? 25 : 35);
+                // Beta 36 one-shot underrun recovery.  Once the stream has been
+                // stable for ~0.9 s, measure how much audio is actually queued.  If
+                // the underrun left a large stale backlog, keep AudioTrack playing
+                // that backlog but temporarily do NOT append newly arriving packets.
+                // The queue therefore drains naturally toward the original Beta 22
+                // latency target without a pause/flush and without the repeated tiny
+                // trims that caused Beta 35's underrun feedback loop.
+                int recoveryPrebufferMs = senderTransport == 1 ? 45
+                        : (senderTransport == 2 ? 25 : 35);
+                int recoveryTargetMs = recoveryPrebufferMs + selectedCushionMs;
+                long recoveryPlayedFrames = playbackStarted
+                        ? (audioTrack.getPlaybackHeadPosition() & 0xffffffffL) : 0L;
+                long recoveryQueuedFrames =
+                        Math.max(0L, totalFramesWritten - recoveryPlayedFrames);
+                int recoveryQueuedMs = (int) Math.min(
+                        9999L,
+                        (recoveryQueuedFrames * 1000L) / Math.max(1, sampleRate));
+                boolean dropCurrentForCatchUp = false;
 
-                    if (queuedMsNow <= normalTargetMs + 6) {
-                        underrunRecoveryActive = false;
-                        recoveryTrimCounter = 0;
-                        recoveredUnderruns++;
-                    } else if (++recoveryTrimCounter >= 4) {
-                        recoveryTrimCounter = 0;
-                        int bytesPerFrame = Math.max(2, channels * 2);
-                        int halfMsBytes = Math.max(bytesPerFrame,
-                                (sampleRate * bytesPerFrame) / 2000);
-                        halfMsBytes -= halfMsBytes % bytesPerFrame;
-                        recoverySkipBytes = Math.min(
-                                halfMsBytes,
-                                Math.max(0, audioLength - bytesPerFrame));
+                if (playbackStarted && underrunRecoveryPending) {
+                    long recoveryNow = System.currentTimeMillis();
+
+                    if (!underrunCatchUpActive
+                            && recoveryNow - lastUnderrunAtMs >= 900L) {
+                        if (recoveryQueuedMs <= recoveryTargetMs + 12) {
+                            // Nothing significant remains to correct.
+                            underrunRecoveryPending = false;
+                            underrunRecoveryEvents++;
+                        } else if (recoveryQueuedMs >= recoveryTargetMs + 20) {
+                            // Plenty of reserve exists, so a controlled drain is safe.
+                            underrunCatchUpActive = true;
+                        }
+                    }
+
+                    if (underrunCatchUpActive) {
+                        if (recoveryQueuedMs > recoveryTargetMs + 10) {
+                            dropCurrentForCatchUp = true;
+                        } else {
+                            underrunCatchUpActive = false;
+                            underrunRecoveryPending = false;
+                            underrunRecoveryEvents++;
+                        }
                     }
                 }
 
-                int writtenOffset = recoverySkipBytes;
-                while (running && writtenOffset < audioLength) {
-                    int written = audioTrack.write(
-                            datagram.getData(),
-                            audioOffset + writtenOffset,
-                            audioLength - writtenOffset,
-                            AudioTrack.WRITE_BLOCKING);
-                    if (written < 0) {
-                        throw new IllegalStateException("Phone audio output failed");
+                if (!dropCurrentForCatchUp) {
+                    int writtenOffset = 0;
+                    while (running && writtenOffset < audioLength) {
+                        int written = audioTrack.write(
+                                datagram.getData(),
+                                audioOffset + writtenOffset,
+                                audioLength - writtenOffset,
+                                AudioTrack.WRITE_BLOCKING);
+                        if (written < 0) {
+                            throw new IllegalStateException("Phone audio output failed");
+                        }
+                        writtenOffset += written;
+                        totalFramesWritten += written / Math.max(2, channels * 2);
+                        if (!playbackStarted) bufferedBeforePlay += written;
                     }
-                    writtenOffset += written;
-                    totalFramesWritten += written / Math.max(2, channels * 2);
-                    if (!playbackStarted) bufferedBeforePlay += written;
                 }
 
                 if (previousAudioPacket == null
@@ -652,9 +675,10 @@ public class ReceiverService extends Service {
                             + " • queue ~" + queuedMs + " ms\n"
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
-                            + " • Underrun recovery " + recoveredUnderruns
-                            + (underrunRecoveryActive ? " (working)" : "")
                             + " • Underruns " + underruns
+                            + " • UR " + underrunRecoveryEvents
+                            + (underrunCatchUpActive ? " (catch-up)" :
+                                    (underrunRecoveryPending ? " (armed)" : ""))
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;
                 }

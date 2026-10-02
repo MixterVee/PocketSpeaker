@@ -8,11 +8,11 @@
     <AssemblyName>PocketSpeaker</AssemblyName>
     <RootNamespace>PocketSpeaker.Windows</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.1.0.33</Version>
-    <AssemblyVersion>1.1.0.33</AssemblyVersion>
-    <FileVersion>1.1.0.33</FileVersion>
-    <InformationalVersion>1.1.0-beta33</InformationalVersion>
-    <Product>PocketSpeaker Beta 33</Product>
+    <Version>1.1.0.34</Version>
+    <AssemblyVersion>1.1.0.34</AssemblyVersion>
+    <FileVersion>1.1.0.34</FileVersion>
+    <InformationalVersion>1.1.0-beta34</InformationalVersion>
+    <Product>PocketSpeaker Beta 34</Product>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="NAudio" Version="3.1.0" />

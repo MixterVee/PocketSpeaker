@@ -619,8 +619,12 @@ public class ReceiverService extends Service {
                         audioLength);
                 previousAudioLength = audioLength;
 
-                int prebufferMs = senderTransport == 1 ? 45
-                        : (senderTransport == 2 ? 25 : 35);
+                // Beta 31: one ~7 ms packet of preventative reserve. This is deliberately
+                // tiny: enough to ride through a brief scheduling hiccup without restoring
+                // the large cushions that previously hurt latency. Beta 30 catch-up remains
+                // unchanged as the fallback if AudioTrack still underruns.
+                int prebufferMs = senderTransport == 1 ? 52
+                        : (senderTransport == 2 ? 32 : 42);
                 int startupGuardMs = activeResyncId == 0
                         ? selectedStartupGuardMs : 0;
                 int targetPrebufferMs =

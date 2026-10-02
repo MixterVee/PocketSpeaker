@@ -3,7 +3,7 @@ name: Build Pocket Speaker Windows
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "beta43" ]
     paths:
       - "windows/**"
       - ".github/workflows/build-windows.yml"
@@ -46,5 +46,5 @@ jobs:
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: PocketSpeaker-Windows-Beta18-x64
+          name: PocketSpeaker-Windows-Beta43-x64
           path: out/*

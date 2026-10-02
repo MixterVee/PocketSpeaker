@@ -47,10 +47,10 @@ jobs:
             app/build/outputs/apk/release/app-release.apk
 
       - name: Prepare test APK
-        run: cp app/build/outputs/apk/release/app-release.apk PocketSpeaker-v1.1.0-beta32.apk
+        run: cp app/build/outputs/apk/release/app-release.apk PocketSpeaker-v1.1.0-beta33.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: PocketSpeaker-v1.1.0-beta32-signed
-          path: PocketSpeaker-v1.1.0-beta32.apk
+          name: PocketSpeaker-v1.1.0-beta33-signed
+          path: PocketSpeaker-v1.1.0-beta33.apk

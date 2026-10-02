@@ -327,9 +327,8 @@ public class ReceiverService extends Service {
         int underrunRecoveryEvents = 0;
         boolean underrunRecoveryPending = false;
         boolean underrunCatchUpActive = false;
-        int recoveryTrimCounter = 0;
-        int recoveryStableCounter = 0;
         long lastUnderrunAtMs = 0L;
+        long lastHardRecoveryAtMs = 0L;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -413,9 +412,8 @@ public class ReceiverService extends Service {
                     totalFramesWritten = 0L;
                     underrunRecoveryPending = false;
                     underrunCatchUpActive = false;
-                    recoveryTrimCounter = 0;
-                    recoveryStableCounter = 0;
                     lastUnderrunAtMs = 0L;
+                    lastHardRecoveryAtMs = 0L;
                 }
 
                 if (audioTrack == null) {
@@ -516,8 +514,6 @@ public class ReceiverService extends Service {
                     lastUnderrunAtMs = System.currentTimeMillis();
                     underrunRecoveryPending = true;
                     underrunCatchUpActive = false;
-                    recoveryTrimCounter = 0;
-                    recoveryStableCounter = 0;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
@@ -569,17 +565,12 @@ public class ReceiverService extends Service {
                     recoveredPackets += packetsToRecover;
                 }
 
-                // Beta 36 one-shot underrun recovery.  Once the stream has been
-                // stable for ~0.9 s, measure how much audio is actually queued.  If
-                // the underrun left a large stale backlog, keep AudioTrack playing
-                // that backlog but temporarily do NOT append newly arriving packets.
-                // The queue therefore drains naturally toward the original Beta 22
-                // latency target without a pause/flush and without the repeated tiny
-                // trims that caused Beta 35's underrun feedback loop.
-                // Beta 40: restore Beta 38's fixed 20 ms reserve and recovery base.
-                // The only recovery change is completion discipline: once catch-up begins,
-                // keep trimming gently until the queue has actually settled at the target
-                // for several consecutive packets instead of declaring success on one sample.
+                // Beta 41: start again from Beta 38's fixed 20 ms reserve, but
+                // never trim live PCM. If a real underrun leaves a large stale queue,
+                // perform one controlled AudioTrack restart after the stream has had
+                // time to settle. The current packet becomes the first packet of the
+                // new prebuffer, producing one short clean correction instead of
+                // prolonged scratchy/chopped audio.
                 final int underrunSafetyReserveMs = 20;
                 int recoveryPrebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
@@ -592,56 +583,41 @@ public class ReceiverService extends Service {
                 int recoveryQueuedMs = (int) Math.min(
                         9999L,
                         (recoveryQueuedFrames * 1000L) / Math.max(1, sampleRate));
-                int recoverySkipBytes = 0;
 
                 if (playbackStarted && underrunRecoveryPending) {
                     long recoveryNow = System.currentTimeMillis();
 
-                    if (!underrunCatchUpActive
-                            && recoveryNow - lastUnderrunAtMs >= 700L) {
-                        // Always enter catch-up after a real underrun. If the queue is
-                        // already near target, the settle counter below will finish it
-                        // quickly; otherwise it will drain the excess without a flush.
-                        underrunCatchUpActive = true;
-                        recoveryTrimCounter = 0;
-                        recoveryStableCounter = 0;
-                    }
-
-                    if (underrunCatchUpActive) {
-                        if (recoveryQueuedMs > recoveryTargetMs + 3) {
-                            recoveryStableCounter = 0;
-
-                            // Drain about 0.75 ms every second packet. This is still
-                            // deliberately gentle, but faster than Beta 38 so a large
-                            // post-underrun backlog cannot linger for the rest of a song.
-                            if (++recoveryTrimCounter >= 2) {
-                                recoveryTrimCounter = 0;
-                                int bytesPerFrame = Math.max(2, channels * 2);
-                                int trimBytes = Math.max(
-                                        bytesPerFrame,
-                                        (sampleRate * bytesPerFrame * 3) / 4000);
-                                trimBytes -= trimBytes % bytesPerFrame;
-                                recoverySkipBytes = Math.min(
-                                        trimBytes,
-                                        Math.max(0, audioLength - bytesPerFrame));
+                    if (recoveryNow - lastUnderrunAtMs >= 700L) {
+                        if (recoveryQueuedMs <= recoveryTargetMs + 8) {
+                            // The stream recovered naturally; no audible restart needed.
+                            underrunRecoveryPending = false;
+                            underrunRecoveryEvents++;
+                        } else if (recoveryNow - lastHardRecoveryAtMs >= 2500L) {
+                            // Large stale backlog: one clean restart. Do not delete pieces
+                            // of live PCM; flush once and re-prime from the current packet.
+                            try {
+                                audioTrack.pause();
+                                audioTrack.flush();
+                            } catch (Exception ignored) {
                             }
-                        } else {
-                            recoveryTrimCounter = 0;
-
-                            // Do not declare recovery complete from a single queue sample.
-                            // Require several consecutive packets at/near target so a
-                            // momentary dip cannot leave us permanently late.
-                            if (++recoveryStableCounter >= 4) {
-                                underrunCatchUpActive = false;
-                                underrunRecoveryPending = false;
-                                recoveryStableCounter = 0;
-                                underrunRecoveryEvents++;
-                            }
+                            bufferedBeforePlay = 0;
+                            playbackStarted = false;
+                            totalFramesWritten = 0L;
+                            previousAudioPacket = null;
+                            previousAudioLength = 0;
+                            cleanStartupPackets = 6;
+                            selectedCushionMs = adaptiveCushionMs;
+                            selectedStartupGuardMs = adaptiveStartupGuardMs;
+                            underrunRecoveryPending = false;
+                            underrunCatchUpActive = false;
+                            lastHardRecoveryAtMs = recoveryNow;
+                            underrunRecoveryEvents++;
                         }
                     }
                 }
 
-                int writtenOffset = recoverySkipBytes;
+                int writtenOffset = 0;
+
                 while (running && writtenOffset < audioLength) {
                     int written = audioTrack.write(
                             datagram.getData(),

@@ -324,6 +324,14 @@ public class ReceiverService extends Service {
         long totalFramesWritten = 0L;
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
+        // Beta 30: do not disturb Beta 29's clean path. Only after AudioTrack has
+        // actually underrun, cap any latency that accumulates during recovery by
+        // occasionally discarding one newly-arrived packet while playback continues.
+        // This bleeds emergency backlog without pause/flush/resync and automatically
+        // switches itself off once the queue is back near the normal low-latency range.
+        boolean underrunRecoveryActive = false;
+        int recoveryDrops = 0;
+        int recoveryPacketCounter = 0;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -497,6 +505,10 @@ public class ReceiverService extends Service {
                 int currentUnderruns = audioTrack.getUnderrunCount();
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
+                if (alreadyStarved) {
+                    underrunRecoveryActive = true;
+                    recoveryPacketCounter = 0;
+                }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
                 if (playbackStarted
@@ -543,6 +555,41 @@ public class ReceiverService extends Service {
                         }
                     }
                     recoveredPackets += packetsToRecover;
+                }
+
+                // Beta 30 post-underrun catch-up. Measure the real AudioTrack
+                // backlog before writing this packet. If recovery has allowed it to
+                // grow beyond ~65 ms, drop only one of every four fresh packets.
+                // At ~7 ms/packet that catches up gently instead of creating another
+                // starvation event. The untouched pre-underrun path remains identical
+                // to Beta 29.
+                if (underrunRecoveryActive && playbackStarted) {
+                    long recoveryPlayedFrames =
+                            (audioTrack.getPlaybackHeadPosition() & 0xffffffffL);
+                    long recoveryQueuedFrames =
+                            Math.max(0L, totalFramesWritten - recoveryPlayedFrames);
+                    int recoveryQueuedMs = (int) ((recoveryQueuedFrames * 1000L)
+                            / Math.max(1, sampleRate));
+
+                    if (recoveryQueuedMs <= 45) {
+                        underrunRecoveryActive = false;
+                        recoveryPacketCounter = 0;
+                    } else if (recoveryQueuedMs > 65) {
+                        recoveryPacketCounter++;
+                        if ((recoveryPacketCounter & 3) == 0) {
+                            recoveryDrops++;
+                            // Keep this packet as the concealment reference even though
+                            // it is intentionally omitted from AudioTrack.
+                            if (previousAudioPacket == null
+                                    || previousAudioPacket.length < audioLength) {
+                                previousAudioPacket = new byte[audioLength];
+                            }
+                            System.arraycopy(datagram.getData(), audioOffset,
+                                    previousAudioPacket, 0, audioLength);
+                            previousAudioLength = audioLength;
+                            continue;
+                        }
+                    }
                 }
 
                 int writtenOffset = 0;
@@ -611,6 +658,7 @@ public class ReceiverService extends Service {
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
                             + " • Underruns " + underruns
+                            + " • Catch-up " + recoveryDrops
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;
                 }

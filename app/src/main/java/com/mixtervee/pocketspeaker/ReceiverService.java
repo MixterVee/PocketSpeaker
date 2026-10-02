@@ -565,13 +565,14 @@ public class ReceiverService extends Service {
                     recoveredPackets += packetsToRecover;
                 }
 
-                // Beta 41: start again from Beta 38's fixed 20 ms reserve, but
-                // never trim live PCM. If a real underrun leaves a large stale queue,
+                // Beta 42: latency-only experiment. Keep Beta 41 recovery unchanged,
+                // but reduce the fixed safety reserve from 20 ms to 10 ms.
+                // If a real underrun leaves a large stale queue,
                 // perform one controlled AudioTrack restart after the stream has had
                 // time to settle. The current packet becomes the first packet of the
                 // new prebuffer, producing one short clean correction instead of
                 // prolonged scratchy/chopped audio.
-                final int underrunSafetyReserveMs = 20;
+                final int underrunSafetyReserveMs = 10;
                 int recoveryPrebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
                 int recoveryTargetMs =

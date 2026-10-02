@@ -506,8 +506,11 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
                 if (alreadyStarved) {
+                    // Beta 32: the first observed underrun immediately arms catch-up.
+                    // Seed the cadence so the first correction happens on the next
+                    // eligible packet instead of waiting through a full four-packet cycle.
                     underrunRecoveryActive = true;
-                    recoveryPacketCounter = 0;
+                    recoveryPacketCounter = 3;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
@@ -619,12 +622,9 @@ public class ReceiverService extends Service {
                         audioLength);
                 previousAudioLength = audioLength;
 
-                // Beta 31: one ~7 ms packet of preventative reserve. This is deliberately
-                // tiny: enough to ride through a brief scheduling hiccup without restoring
-                // the large cushions that previously hurt latency. Beta 30 catch-up remains
-                // unchanged as the fallback if AudioTrack still underruns.
-                int prebufferMs = senderTransport == 1 ? 52
-                        : (senderTransport == 2 ? 32 : 42);
+                // Beta 32: restore Beta 30's proven low-latency prebuffer.
+                int prebufferMs = senderTransport == 1 ? 45
+                        : (senderTransport == 2 ? 25 : 35);
                 int startupGuardMs = activeResyncId == 0
                         ? selectedStartupGuardMs : 0;
                 int targetPrebufferMs =

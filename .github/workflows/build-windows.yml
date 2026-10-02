@@ -43,8 +43,16 @@ jobs:
         shell: pwsh
         run: dotnet publish windows/PocketSpeaker.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o out
 
+      - name: Read Windows version and name executable
+        shell: pwsh
+        run: |
+          [xml]$proj = Get-Content "windows/PocketSpeaker.Windows.csproj"
+          $version = [string]$proj.Project.PropertyGroup.Version
+          "VERSION_NAME=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Copy-Item "out/PocketSpeaker.exe" "out/PocketSpeaker-$version-Windows-x64.exe"
+
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: PocketSpeaker-Windows-Beta47-x64
-          path: out/*
+          name: PocketSpeaker-${{ env.VERSION_NAME }}-Windows-x64
+          path: out/PocketSpeaker-${{ env.VERSION_NAME }}-Windows-x64.exe

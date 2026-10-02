@@ -331,6 +331,7 @@ public class ReceiverService extends Service {
         // switches itself off once the queue is back near the normal low-latency range.
         boolean underrunRecoveryActive = false;
         int recoveryDrops = 0;
+        int recoveryTrimFrames = 0;
         int recoveryPacketCounter = 0;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
@@ -506,11 +507,11 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
                 if (alreadyStarved) {
-                    // Beta 32: the first observed underrun immediately arms catch-up.
-                    // Seed the cadence so the first correction happens on the next
-                    // eligible packet instead of waiting through a full four-packet cycle.
+                    // Beta 33: restore Beta 30's gentle arming behavior. Catch-up is
+                    // allowed after the first underrun, but corrections are distributed
+                    // as tiny PCM trims rather than whole-packet drops.
                     underrunRecoveryActive = true;
-                    recoveryPacketCounter = 3;
+                    recoveryPacketCounter = 0;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
@@ -560,12 +561,12 @@ public class ReceiverService extends Service {
                     recoveredPackets += packetsToRecover;
                 }
 
-                // Beta 30 post-underrun catch-up. Measure the real AudioTrack
-                // backlog before writing this packet. If recovery has allowed it to
-                // grow beyond ~65 ms, drop only one of every four fresh packets.
-                // At ~7 ms/packet that catches up gently instead of creating another
-                // starvation event. The untouched pre-underrun path remains identical
-                // to Beta 29.
+                // Beta 33 smooth catch-up. Never throw away a whole ~7 ms packet.
+                // When post-underrun backlog exceeds the recovery threshold, trim about
+                // 1 ms from the beginning of every fourth packet. At 48 kHz stereo this
+                // removes only 48 frames at a time, spreading correction over many packets
+                // and prioritizing continuous audio over instant latency recovery.
+                int recoveryTrimBytes = 0;
                 if (underrunRecoveryActive && playbackStarted) {
                     long recoveryPlayedFrames =
                             (audioTrack.getPlaybackHeadPosition() & 0xffffffffL);
@@ -580,22 +581,22 @@ public class ReceiverService extends Service {
                     } else if (recoveryQueuedMs > 65) {
                         recoveryPacketCounter++;
                         if ((recoveryPacketCounter & 3) == 0) {
-                            recoveryDrops++;
-                            // Keep this packet as the concealment reference even though
-                            // it is intentionally omitted from AudioTrack.
-                            if (previousAudioPacket == null
-                                    || previousAudioPacket.length < audioLength) {
-                                previousAudioPacket = new byte[audioLength];
+                            int bytesPerFrame = Math.max(2, channels * 2);
+                            int trimFrames = Math.max(1, sampleRate / 1000);
+                            recoveryTrimBytes = Math.min(
+                                    audioLength - (audioLength % bytesPerFrame),
+                                    trimFrames * bytesPerFrame);
+                            if (recoveryTrimBytes >= audioLength) {
+                                recoveryTrimBytes = 0;
+                            } else {
+                                recoveryDrops++;
+                                recoveryTrimFrames += recoveryTrimBytes / bytesPerFrame;
                             }
-                            System.arraycopy(datagram.getData(), audioOffset,
-                                    previousAudioPacket, 0, audioLength);
-                            previousAudioLength = audioLength;
-                            continue;
                         }
                     }
                 }
 
-                int writtenOffset = 0;
+                int writtenOffset = recoveryTrimBytes;
                 while (running && writtenOffset < audioLength) {
                     int written = audioTrack.write(
                             datagram.getData(),
@@ -663,6 +664,7 @@ public class ReceiverService extends Service {
                             + " • Recovered " + recoveredPackets
                             + " • Underruns " + underruns
                             + " • Catch-up " + recoveryDrops
+                            + " (" + recoveryTrimFrames + "f)"
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;
                 }

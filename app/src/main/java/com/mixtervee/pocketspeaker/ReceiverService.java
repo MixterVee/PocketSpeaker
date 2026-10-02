@@ -570,9 +570,13 @@ public class ReceiverService extends Service {
                 // The queue therefore drains naturally toward the original Beta 22
                 // latency target without a pause/flush and without the repeated tiny
                 // trims that caused Beta 35's underrun feedback loop.
+                // Beta 37: retain a small 12 ms playback reserve. This is the
+                // only timing change from Beta 36; the one-shot recovery is unchanged.
+                final int underrunSafetyReserveMs = 12;
                 int recoveryPrebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
-                int recoveryTargetMs = recoveryPrebufferMs + selectedCushionMs;
+                int recoveryTargetMs =
+                        recoveryPrebufferMs + selectedCushionMs + underrunSafetyReserveMs;
                 long recoveryPlayedFrames = playbackStarted
                         ? (audioTrack.getPlaybackHeadPosition() & 0xffffffffL) : 0L;
                 long recoveryQueuedFrames =
@@ -642,7 +646,8 @@ public class ReceiverService extends Service {
                 int startupGuardMs = activeResyncId == 0
                         ? selectedStartupGuardMs : 0;
                 int targetPrebufferMs =
-                        prebufferMs + selectedCushionMs + startupGuardMs;
+                        prebufferMs + selectedCushionMs + startupGuardMs
+                                + underrunSafetyReserveMs;
                 int targetPrebufferBytes = Math.max(
                         (sampleRate * channels * 2 * targetPrebufferMs) / 1000,
                         audioLength * 2);

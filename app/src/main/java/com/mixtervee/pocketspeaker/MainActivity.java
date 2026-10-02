@@ -21,7 +21,6 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.SeekBar;
 import android.widget.TextView;
 
 import java.net.DatagramPacket;
@@ -38,7 +37,6 @@ public class MainActivity extends Activity {
     private boolean isTv;
     private TextView statusText;
     private TextView audioModeText;
-    private TextView volumeText;
     private Button testToneButton;
     private Button latencyModeButton;
     private LinearLayout deviceList;
@@ -64,10 +62,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         isTv = detectTv();
-        if (isTv) {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        }
         buildUi();
 
     }
@@ -118,7 +114,7 @@ public class MainActivity extends Activity {
                 ScrollView.LayoutParams.WRAP_CONTENT));
 
         TextView title = new TextView(this);
-        title.setText(isTv ? "Pocket Speaker — TV" : "Pocket Speaker");
+        title.setText(isTv ? "Pocket Speaker — TV  •  Beta 28" : "Pocket Speaker  •  Beta 28");
         title.setTextColor(Color.WHITE);
         title.setTextSize(isTv ? 32 : 28);
         title.setGravity(Gravity.CENTER);
@@ -185,41 +181,6 @@ public class MainActivity extends Activity {
             });
             root.addView(latencyModeButton, buttonParams());
 
-            int savedVolume = getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
-                    .getInt(ReceiverService.PREF_VOLUME, 100);
-            savedVolume = Math.max(0, Math.min(100, savedVolume));
-
-            volumeText = new TextView(this);
-            volumeText.setText("POCKETSPEAKER VOLUME  " + savedVolume + "%");
-            volumeText.setTextColor(Color.LTGRAY);
-            volumeText.setTextSize(16);
-            volumeText.setGravity(Gravity.CENTER);
-            volumeText.setPadding(0, dp(10), 0, 0);
-            root.addView(volumeText, matchWrap());
-
-            SeekBar volumeSlider = new SeekBar(this);
-            volumeSlider.setMin(0);
-            volumeSlider.setMax(100);
-            volumeSlider.setProgress(savedVolume);
-            volumeSlider.setPadding(dp(12), 0, dp(12), dp(8));
-            volumeSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-                @Override
-                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                    if (fromUser) setReceiverVolume(progress);
-                }
-                @Override public void onStartTrackingTouch(SeekBar seekBar) { }
-                @Override public void onStopTrackingTouch(SeekBar seekBar) { }
-            });
-            root.addView(volumeSlider, matchWrap());
-
-            TextView backgroundHint = new TextView(this);
-            backgroundHint.setText("Audio keeps playing with the screen off.");
-            backgroundHint.setTextColor(Color.GRAY);
-            backgroundHint.setTextSize(13);
-            backgroundHint.setGravity(Gravity.CENTER);
-            backgroundHint.setPadding(0, 0, 0, dp(8));
-            root.addView(backgroundHint, matchWrap());
-
             deviceList = new LinearLayout(this);
             deviceList.setOrientation(LinearLayout.VERTICAL);
             root.addView(deviceList, matchWrap());
@@ -279,20 +240,6 @@ public class MainActivity extends Activity {
             dialog.getWindow().setSoftInputMode(
                     WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         }
-    }
-
-    private void setReceiverVolume(int percent) {
-        percent = Math.max(0, Math.min(100, percent));
-        if (volumeText != null) {
-            volumeText.setText("POCKETSPEAKER VOLUME  " + percent + "%");
-        }
-        getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
-                .edit().putInt(ReceiverService.PREF_VOLUME, percent).apply();
-
-        Intent intent = new Intent(this, ReceiverService.class);
-        intent.setAction(ReceiverService.ACTION_SET_VOLUME);
-        intent.putExtra(ReceiverService.EXTRA_VOLUME, percent);
-        startService(intent);
     }
 
     private boolean isLowLatencyEnabled() {

@@ -497,6 +497,22 @@ public class ReceiverService extends Service {
                 int currentUnderruns = audioTrack.getUnderrunCount();
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
+
+                // Beta 43: if Android really starves, immediately throw away only the
+                // stale queued output and re-prime using Beta 22's existing target.
+                // Do not enlarge the cushion, so recovery cannot ratchet latency upward.
+                if (alreadyStarved) {
+                    try {
+                        audioTrack.pause();
+                        audioTrack.flush();
+                    } catch (Exception ignored) {
+                    }
+                    playbackStarted = false;
+                    bufferedBeforePlay = 0;
+                    totalFramesWritten = 0L;
+                    previousAudioPacket = null;
+                    previousAudioLength = 0;
+                }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
                 if (playbackStarted

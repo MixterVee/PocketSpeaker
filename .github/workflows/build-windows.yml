@@ -46,5 +46,5 @@ jobs:
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: PocketSpeaker-Windows-Beta37-x64
+          name: PocketSpeaker-Windows-Beta38-x64
           path: out/*

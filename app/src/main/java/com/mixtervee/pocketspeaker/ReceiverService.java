@@ -327,6 +327,7 @@ public class ReceiverService extends Service {
         int underrunRecoveryEvents = 0;
         boolean underrunRecoveryPending = false;
         boolean underrunCatchUpActive = false;
+        int recoveryTrimCounter = 0;
         long lastUnderrunAtMs = 0L;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
@@ -411,6 +412,7 @@ public class ReceiverService extends Service {
                     totalFramesWritten = 0L;
                     underrunRecoveryPending = false;
                     underrunCatchUpActive = false;
+                    recoveryTrimCounter = 0;
                     lastUnderrunAtMs = 0L;
                 }
 
@@ -512,6 +514,7 @@ public class ReceiverService extends Service {
                     lastUnderrunAtMs = System.currentTimeMillis();
                     underrunRecoveryPending = true;
                     underrunCatchUpActive = false;
+                    recoveryTrimCounter = 0;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
@@ -570,9 +573,10 @@ public class ReceiverService extends Service {
                 // The queue therefore drains naturally toward the original Beta 22
                 // latency target without a pause/flush and without the repeated tiny
                 // trims that caused Beta 35's underrun feedback loop.
-                // Beta 37: retain a small 12 ms playback reserve. This is the
-                // only timing change from Beta 36; the one-shot recovery is unchanged.
-                final int underrunSafetyReserveMs = 12;
+                // Beta 38: keep the Beta 22 low-latency path, but retain a modest
+                // 20 ms playback reserve. Recovery below is one-shot and rate-limited:
+                // it never permanently grows the target and never drops a whole packet.
+                final int underrunSafetyReserveMs = 20;
                 int recoveryPrebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
                 int recoveryTargetMs =
@@ -584,49 +588,65 @@ public class ReceiverService extends Service {
                 int recoveryQueuedMs = (int) Math.min(
                         9999L,
                         (recoveryQueuedFrames * 1000L) / Math.max(1, sampleRate));
-                boolean dropCurrentForCatchUp = false;
+                int recoverySkipBytes = 0;
 
                 if (playbackStarted && underrunRecoveryPending) {
                     long recoveryNow = System.currentTimeMillis();
 
                     if (!underrunCatchUpActive
-                            && recoveryNow - lastUnderrunAtMs >= 900L) {
-                        if (recoveryQueuedMs <= recoveryTargetMs + 12) {
+                            && recoveryNow - lastUnderrunAtMs >= 700L) {
+                        if (recoveryQueuedMs <= recoveryTargetMs + 6) {
                             // Nothing significant remains to correct.
                             underrunRecoveryPending = false;
+                            recoveryTrimCounter = 0;
                             underrunRecoveryEvents++;
-                        } else if (recoveryQueuedMs >= recoveryTargetMs + 20) {
-                            // Plenty of reserve exists, so a controlled drain is safe.
+                        } else {
+                            // Beta 37 had a dead zone between +12 and +20 ms where
+                            // recovery could remain armed indefinitely. Any meaningful
+                            // excess now enters the same controlled catch-up path.
                             underrunCatchUpActive = true;
+                            recoveryTrimCounter = 0;
                         }
                     }
 
                     if (underrunCatchUpActive) {
-                        if (recoveryQueuedMs > recoveryTargetMs + 10) {
-                            dropCurrentForCatchUp = true;
+                        if (recoveryQueuedMs > recoveryTargetMs + 5) {
+                            // Shed only 0.5 ms every second packet. This drains stale
+                            // latency gradually while preserving the 20 ms reserve and
+                            // avoids Beta 37's whole-packet drops.
+                            if (++recoveryTrimCounter >= 2) {
+                                recoveryTrimCounter = 0;
+                                int bytesPerFrame = Math.max(2, channels * 2);
+                                int halfMsBytes = Math.max(
+                                        bytesPerFrame,
+                                        (sampleRate * bytesPerFrame) / 2000);
+                                halfMsBytes -= halfMsBytes % bytesPerFrame;
+                                recoverySkipBytes = Math.min(
+                                        halfMsBytes,
+                                        Math.max(0, audioLength - bytesPerFrame));
+                            }
                         } else {
                             underrunCatchUpActive = false;
                             underrunRecoveryPending = false;
+                            recoveryTrimCounter = 0;
                             underrunRecoveryEvents++;
                         }
                     }
                 }
 
-                if (!dropCurrentForCatchUp) {
-                    int writtenOffset = 0;
-                    while (running && writtenOffset < audioLength) {
-                        int written = audioTrack.write(
-                                datagram.getData(),
-                                audioOffset + writtenOffset,
-                                audioLength - writtenOffset,
-                                AudioTrack.WRITE_BLOCKING);
-                        if (written < 0) {
-                            throw new IllegalStateException("Phone audio output failed");
-                        }
-                        writtenOffset += written;
-                        totalFramesWritten += written / Math.max(2, channels * 2);
-                        if (!playbackStarted) bufferedBeforePlay += written;
+                int writtenOffset = recoverySkipBytes;
+                while (running && writtenOffset < audioLength) {
+                    int written = audioTrack.write(
+                            datagram.getData(),
+                            audioOffset + writtenOffset,
+                            audioLength - writtenOffset,
+                            AudioTrack.WRITE_BLOCKING);
+                    if (written < 0) {
+                        throw new IllegalStateException("Phone audio output failed");
                     }
+                    writtenOffset += written;
+                    totalFramesWritten += written / Math.max(2, channels * 2);
+                    if (!playbackStarted) bufferedBeforePlay += written;
                 }
 
                 if (previousAudioPacket == null

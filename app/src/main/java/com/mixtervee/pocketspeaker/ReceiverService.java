@@ -357,12 +357,31 @@ public class ReceiverService extends Service {
                         sendStatus("Connecting to " + senderName + " • retrying automatically…");
                         continue;
                     }
-                    throw timeout;
+                    // Beta 45: if an established UDP stream goes silent, do not kill the
+                    // receiver. Re-issue CONNECT so the sender clears/re-arms its live UDP
+                    // path, flush any stale Android output, and wait for fresh packets.
+                    try {
+                        if (playbackStarted && audioTrack != null) audioTrack.pause();
+                        if (audioTrack != null) audioTrack.flush();
+                    } catch (Exception ignored) {
+                    }
+                    playbackStarted = false;
+                    bufferedBeforePlay = 0;
+                    totalFramesWritten = 0L;
+                    previousAudioPacket = null;
+                    previousAudioLength = 0;
+                    lastSequence = -1;
+                    cleanStartupPackets = 6;
+                    selectedCushionMs = adaptiveCushionMs;
+                    selectedStartupGuardMs = adaptiveStartupGuardMs;
+                    sendConnectRequest(senderIp, true);
+                    sendStatus("UDP stream stalled • reconnecting automatically…");
+                    continue;
                 }
 
                 if (!receivedFirstAudio) {
                     receivedFirstAudio = true;
-                    udpAudioSocket.setSoTimeout(10000);
+                    udpAudioSocket.setSoTimeout(1500);
                 }
 
                 if (datagram.getLength() <= 28) continue;

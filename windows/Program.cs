@@ -216,12 +216,6 @@ internal sealed class Sender : IDisposable
                 phoneAudioPort = parts.Length > 2 && int.TryParse(parts[2], out var ap) ? ap : Protocol.UdpAudioPort;
                 bool requestedLowLatency =
                     parts.Length > 3 && parts[3].Equals("UDP", StringComparison.OrdinalIgnoreCase);
-                bool sameUdpClient = requestedLowLatency
-                    && lowLatency
-                    && udp != null
-                    && phone != null
-                    && phone.Address.Equals(r.RemoteEndPoint.Address);
-
                 lowLatency = requestedLowLatency;
                 phone = new IPEndPoint(r.RemoteEndPoint.Address, lowLatency ? phoneAudioPort : streamPort);
                 senderTransport = DetermineSenderTransport(r.RemoteEndPoint.Address);
@@ -237,14 +231,13 @@ internal sealed class Sender : IDisposable
                     tcp = null;
                     tcpStream = null;
 
-                    // Repeated taps from the phone are harmless now. Keep a healthy UDP
-                    // socket instead of closing/reopening it in the middle of streaming.
-                    if (!sameUdpClient)
-                    {
-                        udp?.Dispose();
-                        udp = new UdpClient();
-                        udp.Client.SendBufferSize = 131072;
-                    }
+                    // Beta 46: every UDP CONNECT is a hard transport re-arm. Beta 45
+                    // could receive the recovery CONNECT while leaving a wedged sender
+                    // socket/session alive. Recreate it so recovery starts from a genuinely
+                    // fresh UDP sender state; normal playback is otherwise unchanged.
+                    udp?.Dispose();
+                    udp = new UdpClient();
+                    udp.Client.SendBufferSize = 131072;
 
                     status($"Connected to phone at {r.RemoteEndPoint.Address} • LOW LATENCY UDP.");
                     udpReady.Set();
@@ -501,7 +494,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta 45";
+        Text = "Pocket Speaker — Beta 46";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;

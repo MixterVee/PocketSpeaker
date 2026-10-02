@@ -311,6 +311,7 @@ public class ReceiverService extends Service {
         int activeResyncId = 0;
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
+        boolean waitingForFreshEpoch = false;
         long lastMeterUpdate = 0L;
         // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
         // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
@@ -371,10 +372,11 @@ public class ReceiverService extends Service {
                     previousAudioPacket = null;
                     previousAudioLength = 0;
                     lastSequence = -1;
+                    waitingForFreshEpoch = true;
                     cleanStartupPackets = 6;
                     selectedCushionMs = adaptiveCushionMs;
                     selectedStartupGuardMs = adaptiveStartupGuardMs;
-                    sendConnectRequest(senderIp, true);
+                    sendRecoveryConnectRequest(senderIp);
                     sendStatus("UDP stream stalled • reconnecting automatically…");
                     continue;
                 }
@@ -408,8 +410,20 @@ public class ReceiverService extends Service {
                     continue;
                 }
 
+                // Beta 47 recovery epochs: after an underrun/reconnect request, keep
+                // discarding packets from the old epoch until Windows confirms the
+                // freshly re-armed stream with a higher epoch. Once an epoch advances,
+                // any late datagrams from earlier epochs remain permanently stale.
+                if (packetResyncId < activeResyncId) {
+                    continue;
+                }
+                if (waitingForFreshEpoch && packetResyncId <= activeResyncId) {
+                    continue;
+                }
+
                 if (packetResyncId > activeResyncId || requested > activeResyncId) {
                     activeResyncId = Math.max(packetResyncId, requested);
+                    waitingForFreshEpoch = false;
                     try {
                         if (playbackStarted && audioTrack != null) audioTrack.pause();
                         if (audioTrack != null) audioTrack.flush();
@@ -420,9 +434,11 @@ public class ReceiverService extends Service {
                     lastSequence = sequence - 1;
                     previousAudioPacket = null;
                     previousAudioLength = 0;
-                    cleanStartupPackets = 0;
-                    selectedCushionMs = fallbackCushionMs;
-                    selectedStartupGuardMs = fallbackStartupGuardMs;
+                    // Recovery should return to the same tight target that was working
+                    // before the underrun, not establish a new delayed equilibrium.
+                    cleanStartupPackets = 6;
+                    selectedCushionMs = adaptiveCushionMs;
+                    selectedStartupGuardMs = adaptiveStartupGuardMs;
                     totalFramesWritten = 0L;
                 }
 
@@ -517,10 +533,11 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 44: a real underrun means timing is no longer trustworthy.
-                // Flush Android AND tell the Windows sender to discard its queued UDP
-                // audio. That makes the next packets "now" rather than replaying the
-                // backlog that caused Beta 43's permanent post-underrun delay.
+                // Beta 47: a real underrun invalidates the old timing epoch. Flush the
+                // phone, ask Windows for a hard re-arm with a new epoch, and do not feed
+                // any more old-epoch audio into AudioTrack. This fixes the Beta 46 case
+                // where Windows reset sequence numbers but Android could keep expecting
+                // the old sequence and reject the fresh stream.
                 if (alreadyStarved) {
                     try {
                         audioTrack.pause();
@@ -532,15 +549,19 @@ public class ReceiverService extends Service {
                     totalFramesWritten = 0L;
                     previousAudioPacket = null;
                     previousAudioLength = 0;
+                    lastSequence = -1;
+                    waitingForFreshEpoch = true;
                     cleanStartupPackets = 6;
                     selectedCushionMs = adaptiveCushionMs;
                     selectedStartupGuardMs = adaptiveStartupGuardMs;
+                    lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
                     try {
-                        // Reusing CONNECT is intentional: the sender already treats a
-                        // same-phone UDP CONNECT as harmless and clears its UDP queue.
-                        sendConnectRequest(senderIp, true);
+                        sendRecoveryConnectRequest(senderIp);
                     } catch (Exception ignored) {
                     }
+                    // The packet that exposed the underrun belongs to the old epoch.
+                    // Skip it and wait for the first packet from the re-armed sender.
+                    continue;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
@@ -723,10 +744,20 @@ public class ReceiverService extends Service {
     }
 
     private void sendConnectRequest(String senderIp, boolean lowLatency) throws Exception {
+        sendConnectRequest(senderIp, lowLatency, false);
+    }
+
+    private void sendRecoveryConnectRequest(String senderIp) throws Exception {
+        sendConnectRequest(senderIp, true, true);
+    }
+
+    private void sendConnectRequest(
+            String senderIp, boolean lowLatency, boolean recovery) throws Exception {
         String message = NetworkProtocol.CONNECT_PREFIX
                 + NetworkProtocol.STREAM_PORT + "|" + NetworkProtocol.RESYNC_PORT
                 + "|" + NetworkProtocol.UDP_AUDIO_PORT
-                + "|" + (lowLatency ? "UDP" : "TCP");
+                + "|" + (lowLatency ? "UDP" : "TCP")
+                + (lowLatency && recovery ? "|RECOVER" : "");
         byte[] bytes = message.getBytes(StandardCharsets.UTF_8);
         InetAddress sender = InetAddress.getByName(senderIp);
         try (DatagramSocket socket = new DatagramSocket()) {

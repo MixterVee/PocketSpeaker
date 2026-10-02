@@ -216,11 +216,19 @@ internal sealed class Sender : IDisposable
                 phoneAudioPort = parts.Length > 2 && int.TryParse(parts[2], out var ap) ? ap : Protocol.UdpAudioPort;
                 bool requestedLowLatency =
                     parts.Length > 3 && parts[3].Equals("UDP", StringComparison.OrdinalIgnoreCase);
+                bool requestedRecovery =
+                    parts.Length > 4 && parts[4].Equals("RECOVER", StringComparison.OrdinalIgnoreCase);
                 lowLatency = requestedLowLatency;
                 phone = new IPEndPoint(r.RemoteEndPoint.Address, lowLatency ? phoneAudioPort : streamPort);
                 senderTransport = DetermineSenderTransport(r.RemoteEndPoint.Address);
                 sequence = 0;
-                resyncId = 0;
+                // Beta 47: an explicit recovery CONNECT advances the UDP epoch.
+                // Fresh packets can then be distinguished from stale datagrams that
+                // were already queued on the phone when the underrun was detected.
+                if (requestedLowLatency && requestedRecovery)
+                    resyncId = resyncId == int.MaxValue ? 1 : resyncId + 1;
+                else
+                    resyncId = 0;
                 firstAudioReported = false;
                 packetsSent = 0;
                 ClearUdpQueue();
@@ -231,10 +239,10 @@ internal sealed class Sender : IDisposable
                     tcp = null;
                     tcpStream = null;
 
-                    // Beta 46: every UDP CONNECT is a hard transport re-arm. Beta 45
-                    // could receive the recovery CONNECT while leaving a wedged sender
-                    // socket/session alive. Recreate it so recovery starts from a genuinely
-                    // fresh UDP sender state; normal playback is otherwise unchanged.
+                    // Beta 47: every UDP CONNECT is still a hard transport re-arm, but
+                    // recovery CONNECTs also advance the packet epoch above. Android can
+                    // now reject any stale pre-underrun datagrams and lock immediately to
+                    // the fresh low-latency stream.
                     udp?.Dispose();
                     udp = new UdpClient();
                     udp.Client.SendBufferSize = 131072;
@@ -494,7 +502,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta 46";
+        Text = "Pocket Speaker — Beta 47";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;

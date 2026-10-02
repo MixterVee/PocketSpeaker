@@ -498,9 +498,10 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 43: if Android really starves, immediately throw away only the
-                // stale queued output and re-prime using Beta 22's existing target.
-                // Do not enlarge the cushion, so recovery cannot ratchet latency upward.
+                // Beta 44: a real underrun means timing is no longer trustworthy.
+                // Flush Android AND tell the Windows sender to discard its queued UDP
+                // audio. That makes the next packets "now" rather than replaying the
+                // backlog that caused Beta 43's permanent post-underrun delay.
                 if (alreadyStarved) {
                     try {
                         audioTrack.pause();
@@ -512,6 +513,15 @@ public class ReceiverService extends Service {
                     totalFramesWritten = 0L;
                     previousAudioPacket = null;
                     previousAudioLength = 0;
+                    cleanStartupPackets = 6;
+                    selectedCushionMs = adaptiveCushionMs;
+                    selectedStartupGuardMs = adaptiveStartupGuardMs;
+                    try {
+                        // Reusing CONNECT is intentional: the sender already treats a
+                        // same-phone UDP CONNECT as harmless and clears its UDP queue.
+                        sendConnectRequest(senderIp, true);
+                    } catch (Exception ignored) {
+                    }
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 

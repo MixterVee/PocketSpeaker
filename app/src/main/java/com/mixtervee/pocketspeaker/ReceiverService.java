@@ -312,8 +312,7 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
-        // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
+        // Beta 34: exact Beta 21 low-latency receiver baseline restored for stability testing.
         final int fallbackCushionMs = 50;
         final int adaptiveCushionMs = 0;
         final int fallbackStartupGuardMs = 35;
@@ -324,15 +323,6 @@ public class ReceiverService extends Service {
         long totalFramesWritten = 0L;
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
-        // Beta 30: do not disturb Beta 29's clean path. Only after AudioTrack has
-        // actually underrun, cap any latency that accumulates during recovery by
-        // occasionally discarding one newly-arrived packet while playback continues.
-        // This bleeds emergency backlog without pause/flush/resync and automatically
-        // switches itself off once the queue is back near the normal low-latency range.
-        boolean underrunRecoveryActive = false;
-        int recoveryDrops = 0;
-        int recoveryTrimFrames = 0;
-        int recoveryPacketCounter = 0;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -432,14 +422,13 @@ public class ReceiverService extends Service {
                     // A larger AudioTrack does not itself add delay; it leaves room for
                     // the fixed receive reserve and brief Android scheduling jitter.
                     final int audioTrackBufferMs =
-                            senderWifi ? 180 : (senderEthernet ? 150 : 165);
+                            senderWifi ? 150 : (senderEthernet ? 120 : 135);
                     transportLabel = senderWifi
                             ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
 
                     AudioAttributes attributes = new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_MEDIA)
                             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
                             .build();
                     AudioFormat format = new AudioFormat.Builder()
                             .setSampleRate(sampleRate)
@@ -506,13 +495,6 @@ public class ReceiverService extends Service {
                 int currentUnderruns = audioTrack.getUnderrunCount();
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
-                if (alreadyStarved) {
-                    // Beta 33: restore Beta 30's gentle arming behavior. Catch-up is
-                    // allowed after the first underrun, but corrections are distributed
-                    // as tiny PCM trims rather than whole-packet drops.
-                    underrunRecoveryActive = true;
-                    recoveryPacketCounter = 0;
-                }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
                 if (playbackStarted
@@ -561,42 +543,7 @@ public class ReceiverService extends Service {
                     recoveredPackets += packetsToRecover;
                 }
 
-                // Beta 33 smooth catch-up. Never throw away a whole ~7 ms packet.
-                // When post-underrun backlog exceeds the recovery threshold, trim about
-                // 1 ms from the beginning of every fourth packet. At 48 kHz stereo this
-                // removes only 48 frames at a time, spreading correction over many packets
-                // and prioritizing continuous audio over instant latency recovery.
-                int recoveryTrimBytes = 0;
-                if (underrunRecoveryActive && playbackStarted) {
-                    long recoveryPlayedFrames =
-                            (audioTrack.getPlaybackHeadPosition() & 0xffffffffL);
-                    long recoveryQueuedFrames =
-                            Math.max(0L, totalFramesWritten - recoveryPlayedFrames);
-                    int recoveryQueuedMs = (int) ((recoveryQueuedFrames * 1000L)
-                            / Math.max(1, sampleRate));
-
-                    if (recoveryQueuedMs <= 45) {
-                        underrunRecoveryActive = false;
-                        recoveryPacketCounter = 0;
-                    } else if (recoveryQueuedMs > 65) {
-                        recoveryPacketCounter++;
-                        if ((recoveryPacketCounter & 3) == 0) {
-                            int bytesPerFrame = Math.max(2, channels * 2);
-                            int trimFrames = Math.max(1, sampleRate / 1000);
-                            recoveryTrimBytes = Math.min(
-                                    audioLength - (audioLength % bytesPerFrame),
-                                    trimFrames * bytesPerFrame);
-                            if (recoveryTrimBytes >= audioLength) {
-                                recoveryTrimBytes = 0;
-                            } else {
-                                recoveryDrops++;
-                                recoveryTrimFrames += recoveryTrimBytes / bytesPerFrame;
-                            }
-                        }
-                    }
-                }
-
-                int writtenOffset = recoveryTrimBytes;
+                int writtenOffset = 0;
                 while (running && writtenOffset < audioLength) {
                     int written = audioTrack.write(
                             datagram.getData(),
@@ -623,7 +570,6 @@ public class ReceiverService extends Service {
                         audioLength);
                 previousAudioLength = audioLength;
 
-                // Beta 32: restore Beta 30's proven low-latency prebuffer.
                 int prebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
                 int startupGuardMs = activeResyncId == 0
@@ -663,8 +609,6 @@ public class ReceiverService extends Service {
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
                             + " • Underruns " + underruns
-                            + " • Catch-up " + recoveryDrops
-                            + " (" + recoveryTrimFrames + "f)"
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;
                 }

@@ -312,7 +312,8 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        // Beta 34: exact Beta 21 low-latency receiver baseline restored for stability testing.
+        // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
+        // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
         final int fallbackCushionMs = 50;
         final int adaptiveCushionMs = 0;
         final int fallbackStartupGuardMs = 35;
@@ -323,6 +324,9 @@ public class ReceiverService extends Service {
         long totalFramesWritten = 0L;
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
+        int recoveredUnderruns = 0;
+        boolean underrunRecoveryActive = false;
+        int recoveryTrimCounter = 0;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -404,6 +408,8 @@ public class ReceiverService extends Service {
                     selectedCushionMs = fallbackCushionMs;
                     selectedStartupGuardMs = fallbackStartupGuardMs;
                     totalFramesWritten = 0L;
+                    underrunRecoveryActive = false;
+                    recoveryTrimCounter = 0;
                 }
 
                 if (audioTrack == null) {
@@ -422,13 +428,14 @@ public class ReceiverService extends Service {
                     // A larger AudioTrack does not itself add delay; it leaves room for
                     // the fixed receive reserve and brief Android scheduling jitter.
                     final int audioTrackBufferMs =
-                            senderWifi ? 150 : (senderEthernet ? 120 : 135);
+                            senderWifi ? 180 : (senderEthernet ? 150 : 165);
                     transportLabel = senderWifi
                             ? "Wi-Fi" : (senderEthernet ? "Ethernet" : "Network");
 
                     AudioAttributes attributes = new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_MEDIA)
                             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
                             .build();
                     AudioFormat format = new AudioFormat.Builder()
                             .setSampleRate(sampleRate)
@@ -495,6 +502,10 @@ public class ReceiverService extends Service {
                 int currentUnderruns = audioTrack.getUnderrunCount();
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
+                if (alreadyStarved) {
+                    underrunRecoveryActive = true;
+                    recoveryTrimCounter = 0;
+                }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
                 if (playbackStarted
@@ -543,7 +554,40 @@ public class ReceiverService extends Service {
                     recoveredPackets += packetsToRecover;
                 }
 
-                int writtenOffset = 0;
+                // Beta 35 underrun recovery: an underrun must not establish a new,
+                // permanently-late playback position.  Once AudioTrack reports a real
+                // starvation event, measure the queued audio and gently shed only the
+                // excess above the normal Beta 22 target.  Trim about 0.5 ms every
+                // fourth packet so recovery is gradual and avoids the audible gaps
+                // caused by aggressive catch-up attempts.
+                int recoverySkipBytes = 0;
+                if (playbackStarted && underrunRecoveryActive) {
+                    long playedFramesNow =
+                            audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
+                    long queuedFramesNow =
+                            Math.max(0L, totalFramesWritten - playedFramesNow);
+                    int queuedMsNow = (int) ((queuedFramesNow * 1000L)
+                            / Math.max(1, sampleRate));
+                    int normalTargetMs = senderTransport == 1 ? 45
+                            : (senderTransport == 2 ? 25 : 35);
+
+                    if (queuedMsNow <= normalTargetMs + 6) {
+                        underrunRecoveryActive = false;
+                        recoveryTrimCounter = 0;
+                        recoveredUnderruns++;
+                    } else if (++recoveryTrimCounter >= 4) {
+                        recoveryTrimCounter = 0;
+                        int bytesPerFrame = Math.max(2, channels * 2);
+                        int halfMsBytes = Math.max(bytesPerFrame,
+                                (sampleRate * bytesPerFrame) / 2000);
+                        halfMsBytes -= halfMsBytes % bytesPerFrame;
+                        recoverySkipBytes = Math.min(
+                                halfMsBytes,
+                                Math.max(0, audioLength - bytesPerFrame));
+                    }
+                }
+
+                int writtenOffset = recoverySkipBytes;
                 while (running && writtenOffset < audioLength) {
                     int written = audioTrack.write(
                             datagram.getData(),
@@ -608,6 +652,8 @@ public class ReceiverService extends Service {
                             + " • queue ~" + queuedMs + " ms\n"
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
+                            + " • Underrun recovery " + recoveredUnderruns
+                            + (underrunRecoveryActive ? " (working)" : "")
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;

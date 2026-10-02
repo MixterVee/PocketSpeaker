@@ -77,7 +77,7 @@ internal sealed class Sender : IDisposable
         capture = new WasapiRecorderBuilder()
             .WithLoopbackCapture()
             .WithEventSync()
-            .WithBufferLength(9)
+            .WithBufferLength(10)
             .WithMmcssThreadPriority("Pro Audio")
             .Build();
 
@@ -119,7 +119,7 @@ internal sealed class Sender : IDisposable
         };
 
         capture.StartRecording();
-        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 9 ms WASAPI buffer.");
+        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 10 ms WASAPI buffer.");
     }
 
     private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)

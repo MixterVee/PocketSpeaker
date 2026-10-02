@@ -698,3 +698,113 @@ public class ReceiverService extends Service {
                             requestedResyncId = id;
                         }
                     }
+                } catch (Exception e) {
+                    if (running && resyncSocket != null && !resyncSocket.isClosed()) {
+                        // Keep TCP fallback alive even if the UDP listener has a transient error.
+                    }
+                }
+            }
+        }, "PocketSpeaker-Resync");
+        resyncThread.start();
+    }
+
+    private void sendConnectRequest(String senderIp, boolean lowLatency) throws Exception {
+        String message = NetworkProtocol.CONNECT_PREFIX
+                + NetworkProtocol.STREAM_PORT + "|" + NetworkProtocol.RESYNC_PORT
+                + "|" + NetworkProtocol.UDP_AUDIO_PORT
+                + "|" + (lowLatency ? "UDP" : "TCP");
+        byte[] bytes = message.getBytes(StandardCharsets.UTF_8);
+        InetAddress sender = InetAddress.getByName(senderIp);
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.send(new DatagramPacket(
+                    bytes, bytes.length, sender, NetworkProtocol.CONTROL_PORT));
+        }
+    }
+
+    private void createNotificationChannel() {
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (manager != null) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, getString(R.string.channel_receiver), NotificationManager.IMPORTANCE_LOW);
+            manager.createNotificationChannel(channel);
+        }
+    }
+
+    private Notification buildNotification(String text) {
+        Intent launch = new Intent(this, MainActivity.class);
+        PendingIntent pending = PendingIntent.getActivity(this, 0, launch,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        return new Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle("Pocket Speaker")
+                .setContentText(text)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentIntent(pending)
+                .setOngoing(true)
+                .build();
+    }
+
+    private void sendStatus(String status) {
+        Intent intent = new Intent(ACTION_STATUS);
+        intent.setPackage(getPackageName());
+        intent.putExtra("status", status);
+        sendBroadcast(intent);
+    }
+
+    private String safeMessage(Exception e) {
+        String message = e.getMessage();
+        return message == null || message.trim().isEmpty()
+                ? e.getClass().getSimpleName() : message;
+    }
+
+    private synchronized void stopWorkerOnly() {
+        running = false;
+        if (resyncSocket != null) resyncSocket.close();
+        resyncSocket = null;
+        if (resyncThread != null) resyncThread.interrupt();
+        resyncThread = null;
+        try {
+            if (serverSocket != null) serverSocket.close();
+        } catch (Exception ignored) {
+        }
+        try {
+            if (streamSocket != null) streamSocket.close();
+        } catch (Exception ignored) {
+        }
+        if (udpAudioSocket != null) udpAudioSocket.close();
+        udpAudioSocket = null;
+        serverSocket = null;
+        streamSocket = null;
+
+        try {
+            if (audioTrack != null) {
+                audioTrack.pause();
+                audioTrack.flush();
+                audioTrack.release();
+            }
+        } catch (Exception ignored) {
+        }
+        audioTrack = null;
+
+        if (workerThread != null) workerThread.interrupt();
+        workerThread = null;
+
+        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        wifiLock = null;
+
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        wakeLock = null;
+    }
+
+    @Override
+    public void onDestroy() {
+        sessionGeneration++;
+        stopWorkerOnly();
+        sendStatus("Phone speaker stopped.");
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}

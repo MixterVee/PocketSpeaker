@@ -316,7 +316,9 @@ public class ReceiverService extends Service {
         // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
         // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
         final int fallbackCushionMs = 50;
-        final int adaptiveCushionMs = 0;
+        // Beta 48: keep a tiny 10 ms live reserve. Beta 47 proved the epoch recovery;
+        // this reserve is only to bridge brief scheduler starvation before a real underrun.
+        final int adaptiveCushionMs = 10;
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
         int cleanStartupPackets = 0;

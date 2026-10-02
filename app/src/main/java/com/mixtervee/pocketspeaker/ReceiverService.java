@@ -328,6 +328,8 @@ public class ReceiverService extends Service {
         boolean underrunRecoveryPending = false;
         boolean underrunCatchUpActive = false;
         int recoveryTrimCounter = 0;
+        int adaptiveSafetyReserveMs = 8;
+        long lastReserveAdjustAtMs = 0L;
         long lastUnderrunAtMs = 0L;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
@@ -413,6 +415,8 @@ public class ReceiverService extends Service {
                     underrunRecoveryPending = false;
                     underrunCatchUpActive = false;
                     recoveryTrimCounter = 0;
+                    adaptiveSafetyReserveMs = 8;
+                    lastReserveAdjustAtMs = 0L;
                     lastUnderrunAtMs = 0L;
                 }
 
@@ -512,6 +516,8 @@ public class ReceiverService extends Service {
                     // us permanently late, a single catch-up drain will run only after
                     // the stream has remained stable for a short period.
                     lastUnderrunAtMs = System.currentTimeMillis();
+                    adaptiveSafetyReserveMs = Math.min(24, adaptiveSafetyReserveMs + 6);
+                    lastReserveAdjustAtMs = lastUnderrunAtMs;
                     underrunRecoveryPending = true;
                     underrunCatchUpActive = false;
                     recoveryTrimCounter = 0;
@@ -573,10 +579,20 @@ public class ReceiverService extends Service {
                 // The queue therefore drains naturally toward the original Beta 22
                 // latency target without a pause/flush and without the repeated tiny
                 // trims that caused Beta 35's underrun feedback loop.
-                // Beta 38: keep the Beta 22 low-latency path, but retain a modest
-                // 20 ms playback reserve. Recovery below is one-shot and rate-limited:
-                // it never permanently grows the target and never drops a whole packet.
-                final int underrunSafetyReserveMs = 20;
+                // Beta 39: keep Beta 38's rate-limited recovery, but make the safety
+                // reserve adaptive. Start close to the Beta 22 latency target, grow only
+                // after a real underrun, then decay slowly once playback stays healthy.
+                final int underrunSafetyReserveMs = adaptiveSafetyReserveMs;
+                long reserveNow = System.currentTimeMillis();
+                if (playbackStarted
+                        && !underrunRecoveryPending
+                        && !underrunCatchUpActive
+                        && adaptiveSafetyReserveMs > 8
+                        && reserveNow - lastUnderrunAtMs >= 5000L
+                        && reserveNow - lastReserveAdjustAtMs >= 1500L) {
+                    adaptiveSafetyReserveMs--;
+                    lastReserveAdjustAtMs = reserveNow;
+                }
                 int recoveryPrebufferMs = senderTransport == 1 ? 45
                         : (senderTransport == 2 ? 25 : 35);
                 int recoveryTargetMs =

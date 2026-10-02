@@ -29,13 +29,10 @@ import java.nio.charset.StandardCharsets;
 public class ReceiverService extends Service {
     static final String ACTION_CONNECT = "com.mixtervee.pocketspeaker.CONNECT";
     static final String ACTION_STOP = "com.mixtervee.pocketspeaker.STOP_RECEIVER";
-    static final String ACTION_SET_VOLUME = "com.mixtervee.pocketspeaker.SET_VOLUME";
     static final String ACTION_STATUS = "com.mixtervee.pocketspeaker.RECEIVER_STATUS";
     static final String EXTRA_SENDER_IP = "senderIp";
     static final String EXTRA_SENDER_NAME = "senderName";
     static final String EXTRA_LOW_LATENCY = "lowLatency";
-    static final String EXTRA_VOLUME = "volume";
-    static final String PREF_VOLUME = "receiver_volume_percent";
 
     private static final String CHANNEL_ID = "pocket_speaker_receiver";
     private static final int NOTIFICATION_ID = 101;
@@ -53,7 +50,6 @@ public class ReceiverService extends Service {
     private volatile int requestedResyncId;
     private volatile int lastMarkerResyncId;
     private volatile int sessionGeneration;
-    private volatile float receiverVolume = 1.0f;
 
     @Override
     public void onCreate() {
@@ -70,26 +66,11 @@ public class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
 
-        if (ACTION_SET_VOLUME.equals(intent.getAction())) {
-            int percent = Math.max(0, Math.min(100,
-                    intent.getIntExtra(EXTRA_VOLUME, 100)));
-            receiverVolume = percent / 100f;
-            AudioTrack track = audioTrack;
-            if (track != null) {
-                try { track.setVolume(receiverVolume); } catch (Exception ignored) { }
-            }
-            if (!running) stopSelf(startId);
-            return START_NOT_STICKY;
-        }
-
         if (!ACTION_CONNECT.equals(intent.getAction())) return START_NOT_STICKY;
 
         String senderIp = intent.getStringExtra(EXTRA_SENDER_IP);
         String senderName = intent.getStringExtra(EXTRA_SENDER_NAME);
         boolean lowLatency = intent.getBooleanExtra(EXTRA_LOW_LATENCY, false);
-        int savedVolume = getSharedPreferences(CaptureService.PREFS, MODE_PRIVATE)
-                .getInt(PREF_VOLUME, 100);
-        receiverVolume = Math.max(0, Math.min(100, savedVolume)) / 100f;
         if (senderIp == null || senderIp.trim().isEmpty()) {
             sendStatus("No TV address was supplied.");
             stopSelf();
@@ -224,7 +205,6 @@ public class ReceiverService extends Service {
             if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
                 throw new IllegalStateException("Could not initialize phone speaker");
             }
-            audioTrack.setVolume(receiverVolume);
 
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
 
@@ -332,10 +312,7 @@ public class ReceiverService extends Service {
         int bufferedBeforePlay = 0;
         boolean playbackStarted = false;
         long lastMeterUpdate = 0L;
-        long meterPayloadBytes = 0L;
-        long meterWindowStart = System.currentTimeMillis();
-        // Beta 27: restore Beta 22's proven AudioTrack capacity and UDP timing.
-        // Keep later receiver diagnostics and volume control without trimming the audio queue.
+        // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
         // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
         final int fallbackCushionMs = 50;
         final int adaptiveCushionMs = 0;
@@ -474,7 +451,6 @@ public class ReceiverService extends Service {
                     if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
                         throw new IllegalStateException("Could not initialize phone speaker");
                     }
-            audioTrack.setVolume(receiverVolume);
 
                     android.os.Process.setThreadPriority(
                             android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
@@ -510,7 +486,6 @@ public class ReceiverService extends Service {
                 int audioOffset = 28;
                 int audioLength = datagram.getLength() - audioOffset;
                 if (audioLength <= 0) continue;
-                meterPayloadBytes += audioLength;
 
                 int peak = pcmPeakPercent(datagram.getData(), audioOffset, audioLength);
 
@@ -628,22 +603,16 @@ public class ReceiverService extends Service {
                     long queuedFrames = Math.max(0L, totalFramesWritten - playedFrames);
                     int queuedMs = (int) Math.min(
                             9999L, (queuedFrames * 1000L) / Math.max(1, sampleRate));
-                    long meterElapsedMs = Math.max(1L, now - meterWindowStart);
-                    int bitrateKbps = (int) Math.min(99999L,
-                            (meterPayloadBytes * 8L) / meterElapsedMs);
 
                     sendStatus("UDP " + transportLabel
                             + " • signal " + peak + "%"
                             + " • cushion +" + selectedCushionMs + " ms"
-                            + " • queue ~" + queuedMs + " ms"
-                            + " • " + bitrateKbps + " kbps\n"
+                            + " • queue ~" + queuedMs + " ms\n"
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;
-                    meterPayloadBytes = 0L;
-                    meterWindowStart = now;
                 }
             }
 

@@ -114,7 +114,7 @@ public class MainActivity extends Activity {
                 ScrollView.LayoutParams.WRAP_CONTENT));
 
         TextView title = new TextView(this);
-        title.setText(isTv ? "Pocket Speaker — TV  •  Beta 40" : "Pocket Speaker  •  Beta 40");
+        title.setText(isTv ? "Pocket Speaker — TV  •  Beta 41" : "Pocket Speaker  •  Beta 41");
         title.setTextColor(Color.WHITE);
         title.setTextSize(isTv ? 32 : 28);
         title.setGravity(Gravity.CENTER);

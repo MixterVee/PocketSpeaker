@@ -322,9 +322,9 @@ public class ReceiverService extends Service {
         final int adaptiveCushionMs = 28;
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
-        final int predictiveGuardThresholdMs = 26;
+        final int predictiveGuardThresholdMs = 34;
         final int predictiveGuardMs = 4;
-        final int maxPredictiveGuardsPerGap = 2;
+        final int maxPredictiveGuardsPerGap = 5;
         int cleanStartupPackets = 0;
         int selectedCushionMs = fallbackCushionMs;
         int selectedStartupGuardMs = fallbackStartupGuardMs;
@@ -333,6 +333,7 @@ public class ReceiverService extends Service {
         int recoveredPackets = 0;
         int softRecoveries = 0;
         int proactiveGuards = 0;
+        int seamPatches = 0;
         int guardsThisGap = 0;
         boolean recoveryRefill = false;
         final int recoveryRefillMs = 28;
@@ -377,12 +378,12 @@ public class ReceiverService extends Service {
                     long silentForMs = lastAudioPacketAtMs > 0L
                             ? timeoutNow - lastAudioPacketAtMs : Long.MAX_VALUE;
 
-                    // Beta 54 watchdog: a 10 ms receive timeout is not a disconnect.
+                    // Beta 55 watchdog: a 10 ms receive timeout is not a disconnect.
                     // It is an opportunity to inspect the real AudioTrack reserve while
                     // no packet is arriving. If the reserve is already near starvation,
-                    // intervene sooner, while the reserve is still recoverable, with at most two
-                    // smaller faded tails. This buys up to ~8 ms for the
-                    // next datagram. This happens before Android records an underrun.
+                    // intervene sooner, while the reserve is still recoverable, with several
+                    // tiny faded tails. Continuity is the priority for Beta 55: short
+                    // scheduling stalls should be concealed before Android records an underrun.
                     if (silentForMs < 1500L) {
                         if (playbackStarted
                                 && audioTrack != null
@@ -441,6 +442,7 @@ public class ReceiverService extends Service {
                 }
 
                 lastAudioPacketAtMs = System.currentTimeMillis();
+                int guardsBeforePacket = guardsThisGap;
                 guardsThisGap = 0;
 
                 if (!receivedFirstAudio) {
@@ -601,37 +603,39 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 53 fallback: the watchdog above should prevent normal starvation.
-                // If AudioTrack still manages to underrun, retain Beta 52's fresh-live-edge
-                // recovery so the failure cannot turn into permanent latency drift.
+                // Beta 55 continuity recovery: do NOT pause, flush, or drain when the
+                // AudioTrack counter increments. Those hard operations created the audible
+                // hiccup in Beta 54. Keep the stream running and smooth the handoff from the
+                // last good PCM into the newly arrived live packet instead.
                 if (alreadyStarved) {
-                    try {
-                        audioTrack.pause();
-                        audioTrack.flush();
-                    } catch (Exception ignored) {
-                    }
-
-                    drainUdpBacklog(udpAudioSocket);
-
-                    playbackStarted = false;
-                    recoveryRefill = true;
-                    bufferedBeforePlay = 0;
-                    long playedAtRecovery =
-                            audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
-                    totalFramesWritten = playedAtRecovery;
                     softRecoveries++;
                     lastObservedUnderruns =
                             Math.max(lastObservedUnderruns, currentUnderruns);
-
-                    // The drained packets and the packet currently being processed all
-                    // pre-date the new live edge. Forget sequence continuity so the
-                    // first truly fresh packet becomes the new timing anchor.
-                    lastSequence = -1;
-                    previousAudioPacket = null;
-                    previousAudioLength = 0;
-                    continue;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
+
+                int liveBytesConsumed = 0;
+                if (playbackStarted
+                        && previousAudioPacket != null
+                        && previousAudioLength > 0
+                        && (alreadyStarved || guardsBeforePacket > 0)) {
+                    int crossfadeMs = alreadyStarved ? 10 : 6;
+                    liveBytesConsumed = writeReturnCrossfade(
+                            audioTrack,
+                            previousAudioPacket,
+                            previousAudioLength,
+                            datagram.getData(),
+                            audioOffset,
+                            audioLength,
+                            sampleRate,
+                            channels,
+                            crossfadeMs);
+                    totalFramesWritten +=
+                            liveBytesConsumed / Math.max(2, channels * 2);
+                    if (liveBytesConsumed > 0) {
+                        seamPatches++;
+                    }
+                }
 
                 if (playbackStarted
                         && missingPackets > 0
@@ -679,7 +683,7 @@ public class ReceiverService extends Service {
                     recoveredPackets += packetsToRecover;
                 }
 
-                int writtenOffset = 0;
+                int writtenOffset = liveBytesConsumed;
                 while (running && writtenOffset < audioLength) {
                     int written = audioTrack.write(
                             datagram.getData(),
@@ -747,6 +751,7 @@ public class ReceiverService extends Service {
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
                             + " • Guard " + proactiveGuards
+                            + " • Patch " + seamPatches
                             + " • Soft " + softRecoveries
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);
@@ -808,6 +813,67 @@ public class ReceiverService extends Service {
                     guard,
                     writtenTotal,
                     guardBytes - writtenTotal,
+                    AudioTrack.WRITE_BLOCKING);
+            if (written < 0) {
+                throw new IllegalStateException("Phone audio output failed");
+            }
+            writtenTotal += written;
+        }
+        return writtenTotal;
+    }
+
+    private int writeReturnCrossfade(
+            AudioTrack track,
+            byte[] previousAudioPacket,
+            int previousAudioLength,
+            byte[] livePacket,
+            int liveOffset,
+            int liveLength,
+            int sampleRate,
+            int channels,
+            int crossfadeMs) {
+        int frameBytes = Math.max(2, channels * 2);
+        int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
+        int crossfadeBytes = Math.min(
+                Math.min(previousAudioLength, liveLength),
+                bytesPerMs * Math.max(1, crossfadeMs));
+        crossfadeBytes -= crossfadeBytes % frameBytes;
+        if (crossfadeBytes <= 0) return 0;
+
+        byte[] blended = new byte[crossfadeBytes];
+        int previousStart = previousAudioLength - crossfadeBytes;
+        int frameCount = Math.max(1, crossfadeBytes / frameBytes);
+
+        for (int frame = 0; frame < frameCount; frame++) {
+            int livePercent = frameCount <= 1
+                    ? 100
+                    : (frame * 100) / (frameCount - 1);
+            int previousPercent = 100 - livePercent;
+            int frameOffset = frame * frameBytes;
+
+            for (int channel = 0; channel < channels; channel++) {
+                int sampleOffset = frameOffset + (channel * 2);
+                int previousIndex = previousStart + sampleOffset;
+                int liveIndex = liveOffset + sampleOffset;
+
+                int previousSample = (short) ((previousAudioPacket[previousIndex] & 0xff)
+                        | (previousAudioPacket[previousIndex + 1] << 8));
+                int liveSample = (short) ((livePacket[liveIndex] & 0xff)
+                        | (livePacket[liveIndex + 1] << 8));
+
+                int mixed = ((previousSample * previousPercent)
+                        + (liveSample * livePercent)) / 100;
+                blended[sampleOffset] = (byte) (mixed & 0xff);
+                blended[sampleOffset + 1] = (byte) ((mixed >> 8) & 0xff);
+            }
+        }
+
+        int writtenTotal = 0;
+        while (running && writtenTotal < crossfadeBytes) {
+            int written = track.write(
+                    blended,
+                    writtenTotal,
+                    crossfadeBytes - writtenTotal,
                     AudioTrack.WRITE_BLOCKING);
             if (written < 0) {
                 throw new IllegalStateException("Phone audio output failed");

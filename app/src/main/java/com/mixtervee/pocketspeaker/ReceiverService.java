@@ -322,8 +322,8 @@ public class ReceiverService extends Service {
         final int adaptiveCushionMs = 28;
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
-        final int predictiveGuardThresholdMs = 18;
-        final int predictiveGuardMs = 6;
+        final int predictiveGuardThresholdMs = 26;
+        final int predictiveGuardMs = 4;
         final int maxPredictiveGuardsPerGap = 2;
         int cleanStartupPackets = 0;
         int selectedCushionMs = fallbackCushionMs;
@@ -377,10 +377,11 @@ public class ReceiverService extends Service {
                     long silentForMs = lastAudioPacketAtMs > 0L
                             ? timeoutNow - lastAudioPacketAtMs : Long.MAX_VALUE;
 
-                    // Beta 53 watchdog: a 10 ms receive timeout is not a disconnect.
+                    // Beta 54 watchdog: a 10 ms receive timeout is not a disconnect.
                     // It is an opportunity to inspect the real AudioTrack reserve while
                     // no packet is arriving. If the reserve is already near starvation,
-                    // write at most two tiny faded tails to buy up to ~12 ms for the
+                    // intervene sooner, while the reserve is still recoverable, with at most two
+                    // smaller faded tails. This buys up to ~8 ms for the
                     // next datagram. This happens before Android records an underrun.
                     if (silentForMs < 1500L) {
                         if (playbackStarted

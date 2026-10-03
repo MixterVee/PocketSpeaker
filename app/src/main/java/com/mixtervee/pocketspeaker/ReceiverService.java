@@ -385,7 +385,7 @@ public class ReceiverService extends Service {
                     // It is an opportunity to inspect the real AudioTrack reserve while
                     // no packet is arriving. If the reserve is already near starvation,
                     // intervene sooner, while the reserve is still recoverable, with several
-                    // tiny faded tails. Continuity is the priority for Beta 56: short
+                    // tiny faded tails. Continuity is the priority for Beta 57: short
                     // scheduling stalls should be concealed before Android records an underrun.
                     if (silentForMs < 1500L) {
                         if (playbackStarted
@@ -412,7 +412,8 @@ public class ReceiverService extends Service {
                                         previousAudioLength,
                                         activeSampleRate,
                                         activeChannels,
-                                        predictiveGuardMs);
+                                        predictiveGuardMs,
+                                        guardsThisGap);
                                 int guardFrames =
                                         guardedBytes / Math.max(2, activeChannels * 2);
                                 totalFramesWritten += guardFrames;
@@ -629,6 +630,12 @@ public class ReceiverService extends Service {
                         && previousAudioLength > 0
                         && (alreadyStarved || guardsBeforePacket > 0)) {
                     int crossfadeMs = alreadyStarved ? 10 : 6;
+                    // Beta 57: predictive guards now form one continuous fade envelope.
+                    // Start the return blend at the exact level where that envelope ended,
+                    // rather than jumping the repeated tail back to full volume first.
+                    int returnStartGainPercent = guardsBeforePacket > 0
+                            ? Math.max(65, 100 - (guardsBeforePacket * 7))
+                            : 100;
                     liveBytesConsumed = writeReturnCrossfade(
                             audioTrack,
                             previousAudioPacket,
@@ -638,6 +645,7 @@ public class ReceiverService extends Service {
                             audioLength,
                             sampleRate,
                             channels,
+                            returnStartGainPercent,
                             crossfadeMs);
                     totalFramesWritten +=
                             liveBytesConsumed / Math.max(2, channels * 2);
@@ -850,7 +858,8 @@ public class ReceiverService extends Service {
             int previousAudioLength,
             int sampleRate,
             int channels,
-            int guardMs) {
+            int guardMs,
+            int guardIndex) {
         int frameBytes = Math.max(2, channels * 2);
         int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
         int guardBytes = Math.min(previousAudioLength, bytesPerMs * Math.max(1, guardMs));
@@ -861,16 +870,22 @@ public class ReceiverService extends Service {
         int sourceStart = previousAudioLength - guardBytes;
         int sampleCount = Math.max(1, guardBytes / 2);
 
+        // Beta 57: when a stall needs several guards, keep one continuous gain
+        // envelope across them. Beta 56 restarted every 4 ms guard at 100% after
+        // ending the previous one near 70%, which could sound like a tiny dropout/
+        // pulse even though AudioTrack never actually went silent.
+        int startGainPercent = Math.max(65, 100 - (Math.max(0, guardIndex) * 7));
+        int endGainPercent = Math.max(65, startGainPercent - 7);
+
         for (int i = 0; i < guardBytes; i += 2) {
             int source = sourceStart + i;
             int sample = (short) ((previousAudioPacket[source] & 0xff)
                     | (previousAudioPacket[source + 1] << 8));
 
-            // Keep this micro-stretch subtle: start at the original level and fade
-            // only to 70%, then hand immediately to the next real packet.
             int sampleIndex = i / 2;
-            int gainPercent = 100
-                    - ((30 * sampleIndex) / Math.max(1, sampleCount - 1));
+            int gainPercent = startGainPercent
+                    - (((startGainPercent - endGainPercent) * sampleIndex)
+                    / Math.max(1, sampleCount - 1));
             int scaled = (sample * gainPercent) / 100;
             guard[i] = (byte) (scaled & 0xff);
             guard[i + 1] = (byte) ((scaled >> 8) & 0xff);
@@ -900,6 +915,7 @@ public class ReceiverService extends Service {
             int liveLength,
             int sampleRate,
             int channels,
+            int previousGainPercent,
             int crossfadeMs) {
         int frameBytes = Math.max(2, channels * 2);
         int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
@@ -912,11 +928,15 @@ public class ReceiverService extends Service {
         byte[] blended = new byte[crossfadeBytes];
         int previousStart = previousAudioLength - crossfadeBytes;
         int frameCount = Math.max(1, crossfadeBytes / frameBytes);
+        int clampedPreviousGain = Math.max(0, Math.min(100, previousGainPercent));
 
         for (int frame = 0; frame < frameCount; frame++) {
-            int livePercent = frameCount <= 1
-                    ? 100
-                    : (frame * 100) / (frameCount - 1);
+            double progress = frameCount <= 1
+                    ? 1.0
+                    : (double) frame / (double) (frameCount - 1);
+            // Smoothstep avoids the abrupt slope changes of Beta 56's linear blend.
+            double smoothProgress = progress * progress * (3.0 - (2.0 * progress));
+            int livePercent = (int) Math.round(smoothProgress * 100.0);
             int previousPercent = 100 - livePercent;
             int frameOffset = frame * frameBytes;
 
@@ -929,8 +949,10 @@ public class ReceiverService extends Service {
                         | (previousAudioPacket[previousIndex + 1] << 8));
                 int liveSample = (short) ((livePacket[liveIndex] & 0xff)
                         | (livePacket[liveIndex + 1] << 8));
+                int scaledPreviousSample =
+                        (previousSample * clampedPreviousGain) / 100;
 
-                int mixed = ((previousSample * previousPercent)
+                int mixed = ((scaledPreviousSample * previousPercent)
                         + (liveSample * livePercent)) / 100;
                 blended[sampleOffset] = (byte) (mixed & 0xff);
                 blended[sampleOffset + 1] = (byte) ((mixed >> 8) & 0xff);

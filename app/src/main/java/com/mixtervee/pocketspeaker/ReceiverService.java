@@ -329,7 +329,7 @@ public class ReceiverService extends Service {
         int recoveredPackets = 0;
         int softRecoveries = 0;
         boolean recoveryRefill = false;
-        final int recoveryRefillMs = 28;
+        final int recoveryRefillMs = 14;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -538,19 +538,21 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 50: an AudioTrack underrun means the live reserve actually hit
-                // zero. Beta 49 tried to bridge and drain while playback stayed active;
-                // that could leave AudioTrack repeatedly running dry and produced a
-                // micro-underrun feedback loop. Pause immediately, clear only the empty
-                // AudioTrack, then refill a small 28 ms reserve from arriving LIVE packets
-                // before resuming. Do not drain the UDP socket and do not request a new
-                // sender epoch for this short local starvation event.
+                // Beta 51: keep the controlled local recovery from Beta 50, but
+                // never preserve stale network audio. An AudioTrack underrun means
+                // the receiver has fallen behind live time. Pause/flush the empty
+                // output, drain datagrams already queued on the phone, drop the packet
+                // that exposed the underrun, then rebuild only a tiny ~14 ms reserve
+                // from newly arriving packets before resuming.
                 if (alreadyStarved) {
                     try {
                         audioTrack.pause();
                         audioTrack.flush();
                     } catch (Exception ignored) {
                     }
+
+                    drainUdpBacklog(udpAudioSocket);
+
                     playbackStarted = false;
                     recoveryRefill = true;
                     bufferedBeforePlay = 0;
@@ -560,10 +562,14 @@ public class ReceiverService extends Service {
                     softRecoveries++;
                     lastObservedUnderruns =
                             Math.max(lastObservedUnderruns, currentUnderruns);
+
+                    // The drained packets and the packet currently being processed all
+                    // pre-date the new live edge. Forget sequence continuity so the
+                    // first truly fresh packet becomes the new timing anchor.
+                    lastSequence = -1;
                     previousAudioPacket = null;
                     previousAudioLength = 0;
-                    // Keep this current packet: it is the first packet of the controlled
-                    // refill. Dropping it was part of Beta 49's starvation loop.
+                    continue;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 

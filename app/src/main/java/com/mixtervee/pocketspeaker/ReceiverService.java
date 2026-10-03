@@ -915,6 +915,67 @@ public class ReceiverService extends Service {
             int liveLength,
             int sampleRate,
             int channels,
+            int crossfadeMs) {
+        int frameBytes = Math.max(2, channels * 2);
+        int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
+        int crossfadeBytes = Math.min(
+                Math.min(previousAudioLength, liveLength),
+                bytesPerMs * Math.max(1, crossfadeMs));
+        crossfadeBytes -= crossfadeBytes % frameBytes;
+        if (crossfadeBytes <= 0) return 0;
+
+        byte[] blended = new byte[crossfadeBytes];
+        int previousStart = previousAudioLength - crossfadeBytes;
+        int frameCount = Math.max(1, crossfadeBytes / frameBytes);
+
+        for (int frame = 0; frame < frameCount; frame++) {
+            int livePercent = frameCount <= 1
+                    ? 100
+                    : (frame * 100) / (frameCount - 1);
+            int previousPercent = 100 - livePercent;
+            int frameOffset = frame * frameBytes;
+
+            for (int channel = 0; channel < channels; channel++) {
+                int sampleOffset = frameOffset + (channel * 2);
+                int previousIndex = previousStart + sampleOffset;
+                int liveIndex = liveOffset + sampleOffset;
+
+                int previousSample = (short) ((previousAudioPacket[previousIndex] & 0xff)
+                        | (previousAudioPacket[previousIndex + 1] << 8));
+                int liveSample = (short) ((livePacket[liveIndex] & 0xff)
+                        | (livePacket[liveIndex + 1] << 8));
+
+                int mixed = ((previousSample * previousPercent)
+                        + (liveSample * livePercent)) / 100;
+                blended[sampleOffset] = (byte) (mixed & 0xff);
+                blended[sampleOffset + 1] = (byte) ((mixed >> 8) & 0xff);
+            }
+        }
+
+        int writtenTotal = 0;
+        while (running && writtenTotal < crossfadeBytes) {
+            int written = track.write(
+                    blended,
+                    writtenTotal,
+                    crossfadeBytes - writtenTotal,
+                    AudioTrack.WRITE_BLOCKING);
+            if (written < 0) {
+                throw new IllegalStateException("Phone audio output failed");
+            }
+            writtenTotal += written;
+        }
+        return writtenTotal;
+    }
+
+    private int writeReturnCrossfade(
+            AudioTrack track,
+            byte[] previousAudioPacket,
+            int previousAudioLength,
+            byte[] livePacket,
+            int liveOffset,
+            int liveLength,
+            int sampleRate,
+            int channels,
             int previousGainPercent,
             int crossfadeMs) {
         int frameBytes = Math.max(2, channels * 2);
@@ -953,67 +1014,6 @@ public class ReceiverService extends Service {
                         (previousSample * clampedPreviousGain) / 100;
 
                 int mixed = ((scaledPreviousSample * previousPercent)
-                        + (liveSample * livePercent)) / 100;
-                blended[sampleOffset] = (byte) (mixed & 0xff);
-                blended[sampleOffset + 1] = (byte) ((mixed >> 8) & 0xff);
-            }
-        }
-
-        int writtenTotal = 0;
-        while (running && writtenTotal < crossfadeBytes) {
-            int written = track.write(
-                    blended,
-                    writtenTotal,
-                    crossfadeBytes - writtenTotal,
-                    AudioTrack.WRITE_BLOCKING);
-            if (written < 0) {
-                throw new IllegalStateException("Phone audio output failed");
-            }
-            writtenTotal += written;
-        }
-        return writtenTotal;
-    }
-
-    private int writeReturnCrossfade(
-            AudioTrack track,
-            byte[] previousAudioPacket,
-            int previousAudioLength,
-            byte[] livePacket,
-            int liveOffset,
-            int liveLength,
-            int sampleRate,
-            int channels,
-            int crossfadeMs) {
-        int frameBytes = Math.max(2, channels * 2);
-        int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
-        int crossfadeBytes = Math.min(
-                Math.min(previousAudioLength, liveLength),
-                bytesPerMs * Math.max(1, crossfadeMs));
-        crossfadeBytes -= crossfadeBytes % frameBytes;
-        if (crossfadeBytes <= 0) return 0;
-
-        byte[] blended = new byte[crossfadeBytes];
-        int previousStart = previousAudioLength - crossfadeBytes;
-        int frameCount = Math.max(1, crossfadeBytes / frameBytes);
-
-        for (int frame = 0; frame < frameCount; frame++) {
-            int livePercent = frameCount <= 1
-                    ? 100
-                    : (frame * 100) / (frameCount - 1);
-            int previousPercent = 100 - livePercent;
-            int frameOffset = frame * frameBytes;
-
-            for (int channel = 0; channel < channels; channel++) {
-                int sampleOffset = frameOffset + (channel * 2);
-                int previousIndex = previousStart + sampleOffset;
-                int liveIndex = liveOffset + sampleOffset;
-
-                int previousSample = (short) ((previousAudioPacket[previousIndex] & 0xff)
-                        | (previousAudioPacket[previousIndex + 1] << 8));
-                int liveSample = (short) ((livePacket[liveIndex] & 0xff)
-                        | (livePacket[liveIndex + 1] << 8));
-
-                int mixed = ((previousSample * previousPercent)
                         + (liveSample * livePercent)) / 100;
                 blended[sampleOffset] = (byte) (mixed & 0xff);
                 blended[sampleOffset + 1] = (byte) ((mixed >> 8) & 0xff);

@@ -629,10 +629,10 @@ public class ReceiverService extends Service {
                         && previousAudioPacket != null
                         && previousAudioLength > 0
                         && (alreadyStarved || guardsBeforePacket > 0)) {
-                    int crossfadeMs = alreadyStarved ? 10 : 6;
-                    // Beta 57: predictive guards now form one continuous fade envelope.
-                    // Start the return blend at the exact level where that envelope ended,
-                    // rather than jumping the repeated tail back to full volume first.
+                    int crossfadeMs = alreadyStarved ? 14 : 9;
+                    // Beta 58: keep Beta 57's guard envelope and latency settings, but make the
+                    // return to live audio more gradual. A slightly longer return crossfade
+                    // hides the recovery seam without adding any permanent buffer or cushion.
                     int returnStartGainPercent = guardsBeforePacket > 0
                             ? Math.max(65, 100 - (guardsBeforePacket * 7))
                             : 100;

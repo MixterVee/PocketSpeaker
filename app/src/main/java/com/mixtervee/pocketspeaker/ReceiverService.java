@@ -316,12 +316,15 @@ public class ReceiverService extends Service {
         // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
         // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
         final int fallbackCushionMs = 50;
-        // Beta 52: preserve Beta 51's live-edge recovery, but give normal playback
-        // 6 ms more scheduler headroom. This remains a very small reserve and should
-        // prevent many starvation events without giving back the low-latency character.
-        final int adaptiveCushionMs = 16;
+        // Beta 53: build a slightly deeper normal reserve so short Wi-Fi/Android
+        // scheduling stalls are absorbed before AudioTrack can run dry. The watchdog
+        // below adds only a tiny bridge if the queue still approaches the danger zone.
+        final int adaptiveCushionMs = 28;
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
+        final int predictiveGuardThresholdMs = 18;
+        final int predictiveGuardMs = 6;
+        final int maxPredictiveGuardsPerGap = 2;
         int cleanStartupPackets = 0;
         int selectedCushionMs = fallbackCushionMs;
         int selectedStartupGuardMs = fallbackStartupGuardMs;
@@ -329,11 +332,16 @@ public class ReceiverService extends Service {
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
         int softRecoveries = 0;
+        int proactiveGuards = 0;
+        int guardsThisGap = 0;
         boolean recoveryRefill = false;
-        final int recoveryRefillMs = 20;
+        final int recoveryRefillMs = 28;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
+        long lastAudioPacketAtMs = 0L;
+        int activeSampleRate = 0;
+        int activeChannels = 0;
         String transportLabel = "Network";
 
         try {
@@ -364,9 +372,53 @@ public class ReceiverService extends Service {
                         sendStatus("Connecting to " + senderName + " • retrying automatically…");
                         continue;
                     }
-                    // Beta 45: if an established UDP stream goes silent, do not kill the
-                    // receiver. Re-issue CONNECT so the sender clears/re-arms its live UDP
-                    // path, flush any stale Android output, and wait for fresh packets.
+
+                    long timeoutNow = System.currentTimeMillis();
+                    long silentForMs = lastAudioPacketAtMs > 0L
+                            ? timeoutNow - lastAudioPacketAtMs : Long.MAX_VALUE;
+
+                    // Beta 53 watchdog: a 10 ms receive timeout is not a disconnect.
+                    // It is an opportunity to inspect the real AudioTrack reserve while
+                    // no packet is arriving. If the reserve is already near starvation,
+                    // write at most two tiny faded tails to buy up to ~12 ms for the
+                    // next datagram. This happens before Android records an underrun.
+                    if (silentForMs < 1500L) {
+                        if (playbackStarted
+                                && audioTrack != null
+                                && previousAudioPacket != null
+                                && previousAudioLength > 0
+                                && activeSampleRate > 0
+                                && activeChannels > 0
+                                && guardsThisGap < maxPredictiveGuardsPerGap
+                                && audioTrack.getUnderrunCount() <= lastObservedUnderruns) {
+                            long playedFrames =
+                                    audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
+                            long queuedFrames =
+                                    Math.max(0L, totalFramesWritten - playedFrames);
+                            int queuedMs = (int) Math.min(
+                                    9999L,
+                                    (queuedFrames * 1000L)
+                                            / Math.max(1, activeSampleRate));
+
+                            if (queuedMs <= predictiveGuardThresholdMs) {
+                                int guardedBytes = writePredictiveGuard(
+                                        audioTrack,
+                                        previousAudioPacket,
+                                        previousAudioLength,
+                                        activeSampleRate,
+                                        activeChannels,
+                                        predictiveGuardMs);
+                                totalFramesWritten +=
+                                        guardedBytes / Math.max(2, activeChannels * 2);
+                                proactiveGuards++;
+                                guardsThisGap++;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // A genuine long stream silence still uses the proven fresh-epoch
+                    // reconnect path.
                     try {
                         if (playbackStarted && audioTrack != null) audioTrack.pause();
                         if (audioTrack != null) audioTrack.flush();
@@ -387,9 +439,15 @@ public class ReceiverService extends Service {
                     continue;
                 }
 
+                lastAudioPacketAtMs = System.currentTimeMillis();
+                guardsThisGap = 0;
+
                 if (!receivedFirstAudio) {
                     receivedFirstAudio = true;
-                    udpAudioSocket.setSoTimeout(1500);
+                    // Normal packets are ~7 ms apart. A 10 ms timeout gives the watchdog
+                    // a chance to act during a real scheduling/network hiccup without
+                    // firing between healthy packets.
+                    udpAudioSocket.setSoTimeout(10);
                 }
 
                 if (datagram.getLength() <= 28) continue;
@@ -410,6 +468,9 @@ public class ReceiverService extends Service {
 
                 if (encoding != AudioFormat.ENCODING_PCM_16BIT) continue;
                 if (channels != 1 && channels != 2) continue;
+
+                activeSampleRate = sampleRate;
+                activeChannels = channels;
 
                 int requested = requestedResyncId;
                 if (packetResyncId < requested) {
@@ -539,12 +600,9 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 52: retain Beta 51's fresh-live-edge recovery, with a slightly
-                // safer refill. An AudioTrack underrun means the receiver has fallen
-                // behind live time. Pause/flush the empty output, drain datagrams already
-                // queued on the phone, drop the packet that exposed the underrun, then
-                // rebuild only a small ~20 ms reserve from newly arriving packets before
-                // resuming. The extra 6 ms is intentionally conservative.
+                // Beta 53 fallback: the watchdog above should prevent normal starvation.
+                // If AudioTrack still manages to underrun, retain Beta 52's fresh-live-edge
+                // recovery so the failure cannot turn into permanent latency drift.
                 if (alreadyStarved) {
                     try {
                         audioTrack.pause();
@@ -687,6 +745,7 @@ public class ReceiverService extends Service {
                             + " • queue ~" + queuedMs + " ms\n"
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
+                            + " • Guard " + proactiveGuards
                             + " • Soft " + softRecoveries
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);
@@ -708,6 +767,53 @@ public class ReceiverService extends Service {
         } finally {
             if (session == sessionGeneration) stopSelf();
         }
+    }
+
+    private int writePredictiveGuard(
+            AudioTrack track,
+            byte[] previousAudioPacket,
+            int previousAudioLength,
+            int sampleRate,
+            int channels,
+            int guardMs) {
+        int frameBytes = Math.max(2, channels * 2);
+        int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
+        int guardBytes = Math.min(previousAudioLength, bytesPerMs * Math.max(1, guardMs));
+        guardBytes -= guardBytes % frameBytes;
+        if (guardBytes <= 0) return 0;
+
+        byte[] guard = new byte[guardBytes];
+        int sourceStart = previousAudioLength - guardBytes;
+        int sampleCount = Math.max(1, guardBytes / 2);
+
+        for (int i = 0; i < guardBytes; i += 2) {
+            int source = sourceStart + i;
+            int sample = (short) ((previousAudioPacket[source] & 0xff)
+                    | (previousAudioPacket[source + 1] << 8));
+
+            // Keep this micro-stretch subtle: start at the original level and fade
+            // only to 70%, then hand immediately to the next real packet.
+            int sampleIndex = i / 2;
+            int gainPercent = 100
+                    - ((30 * sampleIndex) / Math.max(1, sampleCount - 1));
+            int scaled = (sample * gainPercent) / 100;
+            guard[i] = (byte) (scaled & 0xff);
+            guard[i + 1] = (byte) ((scaled >> 8) & 0xff);
+        }
+
+        int writtenTotal = 0;
+        while (running && writtenTotal < guardBytes) {
+            int written = track.write(
+                    guard,
+                    writtenTotal,
+                    guardBytes - writtenTotal,
+                    AudioTrack.WRITE_BLOCKING);
+            if (written < 0) {
+                throw new IllegalStateException("Phone audio output failed");
+            }
+            writtenTotal += written;
+        }
+        return writtenTotal;
     }
 
     private int writeSoftRecoveryBridge(

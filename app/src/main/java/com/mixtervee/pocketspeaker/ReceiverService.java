@@ -327,6 +327,7 @@ public class ReceiverService extends Service {
         long totalFramesWritten = 0L;
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
+        int softRecoveries = 0;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -535,34 +536,37 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 47: a real underrun invalidates the old timing epoch. Flush the
-                // phone, ask Windows for a hard re-arm with a new epoch, and do not feed
-                // any more old-epoch audio into AudioTrack. This fixes the Beta 46 case
-                // where Windows reset sequence numbers but Android could keep expecting
-                // the old sequence and reject the fresh stream.
+                // Beta 49: keep the proven low-latency target, but do not turn a brief
+                // Android output starvation into a long hard-resync silence. When the
+                // AudioTrack has just starved, write one tiny faded tail (about one UDP
+                // packet) to bridge the handoff, discard only the stale datagrams already
+                // queued on the phone, and resume from the next live packet. The sender
+                // stays in the same epoch, so recovery is immediate and cannot establish
+                // a new delayed equilibrium. A true network stall still falls back to the
+                // Beta 47 fresh-epoch recovery in the socket-timeout path above.
                 if (alreadyStarved) {
-                    try {
-                        audioTrack.pause();
-                        audioTrack.flush();
-                    } catch (Exception ignored) {
+                    if (previousAudioPacket != null && previousAudioLength > 0) {
+                        int bridgedBytes = writeSoftRecoveryBridge(
+                                audioTrack,
+                                previousAudioPacket,
+                                previousAudioLength,
+                                sampleRate,
+                                channels);
+                        totalFramesWritten +=
+                                bridgedBytes / Math.max(2, channels * 2);
                     }
-                    playbackStarted = false;
-                    bufferedBeforePlay = 0;
-                    totalFramesWritten = 0L;
+
+                    // The packet that exposed the underrun may already be stale, and
+                    // more stale packets can be sitting in Android's UDP receive queue.
+                    // Drop that backlog rather than replaying it and permanently adding
+                    // latency. The next packet received after this branch is live audio.
+                    drainUdpBacklog(udpAudioSocket);
+                    softRecoveries++;
+                    lastObservedUnderruns =
+                            Math.max(lastObservedUnderruns, currentUnderruns);
+                    lastSequence = -1;
                     previousAudioPacket = null;
                     previousAudioLength = 0;
-                    lastSequence = -1;
-                    waitingForFreshEpoch = true;
-                    cleanStartupPackets = 6;
-                    selectedCushionMs = adaptiveCushionMs;
-                    selectedStartupGuardMs = adaptiveStartupGuardMs;
-                    lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
-                    try {
-                        sendRecoveryConnectRequest(senderIp);
-                    } catch (Exception ignored) {
-                    }
-                    // The packet that exposed the underrun belongs to the old epoch.
-                    // Skip it and wait for the first packet from the re-armed sender.
                     continue;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
@@ -678,6 +682,7 @@ public class ReceiverService extends Service {
                             + " • queue ~" + queuedMs + " ms\n"
                             + "Lost " + packetLoss
                             + " • Recovered " + recoveredPackets
+                            + " • Soft " + softRecoveries
                             + " • Underruns " + underruns
                             + " • Resyncs " + activeResyncId);
                     lastMeterUpdate = now;
@@ -698,6 +703,87 @@ public class ReceiverService extends Service {
         } finally {
             if (session == sessionGeneration) stopSelf();
         }
+    }
+
+    private int writeSoftRecoveryBridge(
+            AudioTrack track,
+            byte[] previousAudioPacket,
+            int previousAudioLength,
+            int sampleRate,
+            int channels) {
+        int frameBytes = Math.max(2, channels * 2);
+        int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
+
+        // One sender packet is about 7 ms. An 8 ms bridge is long enough to cover
+        // draining the stale socket backlog and waiting for the next live datagram,
+        // without turning recovery itself into noticeable extra latency.
+        int bridgeBytes = Math.min(previousAudioLength, bytesPerMs * 8);
+        bridgeBytes -= bridgeBytes % frameBytes;
+        if (bridgeBytes <= 0) return 0;
+
+        byte[] bridge = new byte[bridgeBytes];
+        int sourceStart = previousAudioLength - bridgeBytes;
+        int sampleCount = Math.max(1, bridgeBytes / 2);
+
+        for (int i = 0; i < bridgeBytes; i += 2) {
+            int source = sourceStart + i;
+            int sample = (short) ((previousAudioPacket[source] & 0xff)
+                    | (previousAudioPacket[source + 1] << 8));
+
+            // Fade the repeated tail from 90% to 25%. That makes the tiny stretch
+            // much less click-prone than repeating a full-level PCM edge.
+            int sampleIndex = i / 2;
+            int gainPercent = 90
+                    - ((65 * sampleIndex) / Math.max(1, sampleCount - 1));
+            int scaled = (sample * gainPercent) / 100;
+            bridge[i] = (byte) (scaled & 0xff);
+            bridge[i + 1] = (byte) ((scaled >> 8) & 0xff);
+        }
+
+        int writtenTotal = 0;
+        while (running && writtenTotal < bridgeBytes) {
+            int written = track.write(
+                    bridge,
+                    writtenTotal,
+                    bridgeBytes - writtenTotal,
+                    AudioTrack.WRITE_BLOCKING);
+            if (written < 0) {
+                throw new IllegalStateException("Phone audio output failed");
+            }
+            writtenTotal += written;
+        }
+        return writtenTotal;
+    }
+
+    private int drainUdpBacklog(DatagramSocket socket) {
+        if (socket == null || socket.isClosed()) return 0;
+
+        int originalTimeout = 1500;
+        int drained = 0;
+        try {
+            originalTimeout = socket.getSoTimeout();
+            socket.setSoTimeout(1);
+
+            byte[] stale = new byte[2048];
+            while (running && drained < 128) {
+                try {
+                    DatagramPacket packet = new DatagramPacket(stale, stale.length);
+                    socket.receive(packet);
+                    drained++;
+                } catch (java.net.SocketTimeoutException caughtUp) {
+                    break;
+                }
+            }
+        } catch (Exception ignored) {
+            // If a platform refuses the temporary timeout, the next normal receive
+            // still resumes the stream; never turn soft recovery into a fatal error.
+        } finally {
+            try {
+                socket.setSoTimeout(originalTimeout);
+            } catch (Exception ignored) {
+            }
+        }
+        return drained;
     }
 
     private int pcmPeakPercent(byte[] data, int length) {

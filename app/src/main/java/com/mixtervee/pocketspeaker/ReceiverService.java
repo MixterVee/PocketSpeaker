@@ -328,6 +328,8 @@ public class ReceiverService extends Service {
         int lastObservedUnderruns = 0;
         int recoveredPackets = 0;
         int softRecoveries = 0;
+        boolean recoveryRefill = false;
+        final int recoveryRefillMs = 28;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -536,38 +538,32 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 49: keep the proven low-latency target, but do not turn a brief
-                // Android output starvation into a long hard-resync silence. When the
-                // AudioTrack has just starved, write one tiny faded tail (about one UDP
-                // packet) to bridge the handoff, discard only the stale datagrams already
-                // queued on the phone, and resume from the next live packet. The sender
-                // stays in the same epoch, so recovery is immediate and cannot establish
-                // a new delayed equilibrium. A true network stall still falls back to the
-                // Beta 47 fresh-epoch recovery in the socket-timeout path above.
+                // Beta 50: an AudioTrack underrun means the live reserve actually hit
+                // zero. Beta 49 tried to bridge and drain while playback stayed active;
+                // that could leave AudioTrack repeatedly running dry and produced a
+                // micro-underrun feedback loop. Pause immediately, clear only the empty
+                // AudioTrack, then refill a small 28 ms reserve from arriving LIVE packets
+                // before resuming. Do not drain the UDP socket and do not request a new
+                // sender epoch for this short local starvation event.
                 if (alreadyStarved) {
-                    if (previousAudioPacket != null && previousAudioLength > 0) {
-                        int bridgedBytes = writeSoftRecoveryBridge(
-                                audioTrack,
-                                previousAudioPacket,
-                                previousAudioLength,
-                                sampleRate,
-                                channels);
-                        totalFramesWritten +=
-                                bridgedBytes / Math.max(2, channels * 2);
+                    try {
+                        audioTrack.pause();
+                        audioTrack.flush();
+                    } catch (Exception ignored) {
                     }
-
-                    // The packet that exposed the underrun may already be stale, and
-                    // more stale packets can be sitting in Android's UDP receive queue.
-                    // Drop that backlog rather than replaying it and permanently adding
-                    // latency. The next packet received after this branch is live audio.
-                    drainUdpBacklog(udpAudioSocket);
+                    playbackStarted = false;
+                    recoveryRefill = true;
+                    bufferedBeforePlay = 0;
+                    long playedAtRecovery =
+                            audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
+                    totalFramesWritten = playedAtRecovery;
                     softRecoveries++;
                     lastObservedUnderruns =
                             Math.max(lastObservedUnderruns, currentUnderruns);
-                    lastSequence = -1;
                     previousAudioPacket = null;
                     previousAudioLength = 0;
-                    continue;
+                    // Keep this current packet: it is the first packet of the controlled
+                    // refill. Dropping it was part of Beta 49's starvation loop.
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
@@ -648,8 +644,9 @@ public class ReceiverService extends Service {
                         : (senderTransport == 2 ? 25 : 35);
                 int startupGuardMs = activeResyncId == 0
                         ? selectedStartupGuardMs : 0;
-                int targetPrebufferMs =
-                        prebufferMs + selectedCushionMs + startupGuardMs;
+                int targetPrebufferMs = recoveryRefill
+                        ? recoveryRefillMs
+                        : prebufferMs + selectedCushionMs + startupGuardMs;
                 int targetPrebufferBytes = Math.max(
                         (sampleRate * channels * 2 * targetPrebufferMs) / 1000,
                         audioLength * 2);
@@ -657,6 +654,7 @@ public class ReceiverService extends Service {
                 if (!playbackStarted && bufferedBeforePlay >= targetPrebufferBytes) {
                     audioTrack.play();
                     playbackStarted = true;
+                    recoveryRefill = false;
                     sendStatus("Playing " + senderName + " • LOW LATENCY UDP"
                             + " • target " + targetPrebufferMs + " ms.");
                 }

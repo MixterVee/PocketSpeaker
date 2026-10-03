@@ -639,8 +639,8 @@ public class ReceiverService extends Service {
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
-                // Beta 59 latency recovery: Beta 58 could conceal the seam but then keep
-                // playing the stale UDP backlog, so every stall could permanently add delay.
+                // Beta 60 latency recovery: keep the useful part of Beta 59 only.
+                // A confirmed recovery stall can add real delay even when its seam is hidden.
                 // Estimate only the part of a short stall that was not covered by the normal
                 // low-latency reserve or by predictive guards, then repay it gradually below.
                 // Ignore very long gaps here because they are more likely a paused source than
@@ -648,34 +648,18 @@ public class ReceiverService extends Service {
                 if (playbackStarted
                         && (alreadyStarved || guardsBeforePacket > 0)
                         && packetArrivalGapMs > 0L
-                        && packetArrivalGapMs <= 750L) {
+                        && packetArrivalGapMs <= 500L) {
                     long guardedMs = (long) guardsBeforePacket * predictiveGuardMs;
                     long uncoveredStallMs = packetArrivalGapMs
                             - packetAudioMs
                             - predictiveGuardThresholdMs
                             - guardedMs;
                     if (uncoveredStallMs > 0L) {
-                        long addMs = Math.min(500L, uncoveredStallMs);
+                        long addMs = Math.min(250L, uncoveredStallMs);
                         recoveryLagDebtFrames +=
                                 (addMs * (long) sampleRate) / 1000L;
                     }
                 }
-
-                // The AudioTrack queue can also grow after a burst even when the explicit
-                // guard counters do not explain it. Treat queue above the intended live target
-                // as temporary catch-up pressure, not as a new stable latency point.
-                long playedFramesForCatchup = playbackStarted
-                        ? (audioTrack.getPlaybackHeadPosition() & 0xffffffffL) : 0L;
-                long queuedFramesForCatchup = Math.max(
-                        0L, totalFramesWritten - playedFramesForCatchup);
-                int queuedMsForCatchup = (int) Math.min(
-                        9999L,
-                        (queuedFramesForCatchup * 1000L) / Math.max(1, sampleRate));
-                int basePrebufferMsForCatchup = senderTransport == 1 ? 45
-                        : (senderTransport == 2 ? 25 : 35);
-                int desiredLiveQueueMs = basePrebufferMsForCatchup + selectedCushionMs;
-                long queueExcessMsForCatchup = Math.max(
-                        0L, queuedMsForCatchup - desiredLiveQueueMs - 12L);
 
                 int liveBytesConsumed = 0;
                 if (playbackStarted
@@ -708,37 +692,25 @@ public class ReceiverService extends Service {
                     healthyPacketsSinceCatchup = 0;
                 } else if (playbackStarted
                         && missingPackets == 0
-                        && (guardDebtFrames > 0L
-                            || recoveryLagDebtFrames > 0L
-                            || queueExcessMsForCatchup >= 6L)
+                        && (guardDebtFrames > 0L || recoveryLagDebtFrames > 0L)
                         && previousAudioPacket != null
                         && previousAudioLength > 0) {
-                    // Beta 59: repay both synthetic guard time and real stall/backlog time.
-                    // Queue pressure is included as a safety net so a burst cannot settle into
-                    // the ~150 ms+ AudioTrack equilibrium seen in Beta 58. Repayment stays in
-                    // tiny crossfaded steps: faster when badly behind, gentler near target.
+                    // Beta 60: Beta 59's queue-pressure catch-up fired almost constantly
+                    // and damaged continuity. Only repay debt that we can tie to an actual
+                    // predictive guard or measured recovery stall. Wait for a meaningful
+                    // amount of debt, then use a single 1 ms crossfaded skip at a deliberately
+                    // slow cadence so the correction should be inaudible.
                     healthyPacketsSinceCatchup++;
                     long guardDebtMs =
                             (guardDebtFrames * 1000L) / Math.max(1, sampleRate);
                     long recoveryLagDebtMs =
                             (recoveryLagDebtFrames * 1000L) / Math.max(1, sampleRate);
                     long totalDebtMs = guardDebtMs + recoveryLagDebtMs;
-                    long effectiveCatchupMs = Math.max(totalDebtMs, queueExcessMsForCatchup);
 
-                    int catchupInterval;
-                    int catchupSkipMs;
-                    if (effectiveCatchupMs >= 500L) {
-                        catchupInterval = 2;
-                        catchupSkipMs = 2;
-                    } else if (effectiveCatchupMs >= 200L) {
-                        catchupInterval = 2;
-                        catchupSkipMs = 1;
-                    } else {
-                        catchupInterval = 3;
-                        catchupSkipMs = 1;
-                    }
+                    int catchupInterval = totalDebtMs >= 300L ? 4 : 7;
+                    int catchupSkipMs = 1;
 
-                    if (effectiveCatchupMs >= 6L
+                    if (totalDebtMs >= 80L
                             && healthyPacketsSinceCatchup >= catchupInterval) {
                         int frameBytes = Math.max(2, channels * 2);
                         int bytesPerMs = Math.max(

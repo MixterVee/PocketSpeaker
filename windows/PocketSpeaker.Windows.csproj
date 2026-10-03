@@ -8,7 +8,7 @@
     <AssemblyName>PocketSpeaker</AssemblyName>
     <RootNamespace>PocketSpeaker.Windows</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.1.0-beta53</Version>
+    <Version>1.1.0-beta54</Version>
     <AssemblyVersion>1.1.0.53</AssemblyVersion>
     <FileVersion>1.1.0.53</FileVersion>
   </PropertyGroup>

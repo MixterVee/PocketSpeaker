@@ -502,7 +502,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta 59";
+        Text = "Pocket Speaker — Beta 60";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;

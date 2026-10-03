@@ -323,12 +323,13 @@ public class ReceiverService extends Service {
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
         final int predictiveGuardThresholdMs = 34;
-        // Beta 62: each sender UDP packet carries about 5 ms of PCM. A 4 ms guard
-        // every 10 ms watchdog cycle still let the queue drain during an 80-150 ms
-        // scheduling stall. Bridge roughly the full watchdog interval instead, and
-        // allow enough retained-audio guards to cover the hard gaps seen in Beta 61.
-        final int predictiveGuardMs = 10;
-        final int maxPredictiveGuardsPerGap = 18;
+        // Beta 63: conceal only the very front edge of a stall. Beta 62 could keep
+        // synthesizing reflected retained audio for up to 180 ms, which turned a hard
+        // gap into prolonged digital dribble. Limit the bridge to about 15 ms total;
+        // beyond that, abandon synthetic audio and restart on a fresh sender epoch.
+        final int predictiveGuardMs = 5;
+        final int maxPredictiveGuardsPerGap = 3;
+        final int hardRecoveryAfterMs = 45;
         int cleanStartupPackets = 0;
         int selectedCushionMs = fallbackCushionMs;
         int selectedStartupGuardMs = fallbackStartupGuardMs;
@@ -398,7 +399,8 @@ public class ReceiverService extends Service {
                                 && previousAudioLength > 0
                                 && activeSampleRate > 0
                                 && activeChannels > 0
-                                && guardsThisGap < maxPredictiveGuardsPerGap) {
+                                && guardsThisGap < maxPredictiveGuardsPerGap
+                                && audioTrack.getUnderrunCount() <= lastObservedUnderruns) {
                             long playedFrames =
                                     audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
                             long queuedFrames =
@@ -424,6 +426,38 @@ public class ReceiverService extends Service {
                                 proactiveGuards++;
                                 guardsThisGap++;
                             }
+                        }
+
+                        // Beta 63 hard escape: once the short concealment budget is gone,
+                        // do not keep repeating/stretched PCM. Drop the stale output queue,
+                        // request a fresh sender epoch, and restart with only the small
+                        // recovery refill. This trades a bounded clean gap for Beta 62's
+                        // prolonged digital corruption and also resets latency immediately.
+                        if (playbackStarted
+                                && !waitingForFreshEpoch
+                                && silentForMs >= hardRecoveryAfterMs
+                                && guardsThisGap >= maxPredictiveGuardsPerGap) {
+                            try {
+                                if (audioTrack != null) audioTrack.pause();
+                                if (audioTrack != null) audioTrack.flush();
+                            } catch (Exception ignored) {
+                            }
+                            playbackStarted = false;
+                            bufferedBeforePlay = 0;
+                            totalFramesWritten = 0L;
+                            guardDebtFrames = 0L;
+                            healthyPacketsSinceCatchup = 0;
+                            previousAudioPacket = null;
+                            previousAudioLength = 0;
+                            lastSequence = -1;
+                            waitingForFreshEpoch = true;
+                            cleanStartupPackets = 6;
+                            selectedCushionMs = adaptiveCushionMs;
+                            selectedStartupGuardMs = adaptiveStartupGuardMs;
+                            guardsThisGap = 0;
+                            recoveryRefill = true;
+                            sendRecoveryConnectRequest(senderIp);
+                            sendStatus("UDP hard gap • clean low-latency recovery…");
                         }
                         continue;
                     }
@@ -720,7 +754,9 @@ public class ReceiverService extends Service {
                         && previousAudioLength > 0) {
                     int bytesPerMs = Math.max(1, (sampleRate * channels * 2) / 1000);
                     int previousPacketMs = Math.max(1, previousAudioLength / bytesPerMs);
-                    int maxRecoveryPackets = Math.max(1, 60 / previousPacketMs);
+                    // Beta 63: sequence-loss concealment gets the same short budget as
+                    // the watchdog bridge. Never repeat old PCM for tens of milliseconds.
+                    int maxRecoveryPackets = Math.max(1, 15 / previousPacketMs);
                     int packetsToRecover = Math.min(missingPackets, maxRecoveryPackets);
                     byte[] concealed = new byte[previousAudioLength];
 
@@ -865,55 +901,31 @@ public class ReceiverService extends Service {
             int guardIndex) {
         int frameBytes = Math.max(2, channels * 2);
         int bytesPerMs = Math.max(frameBytes, (sampleRate * frameBytes) / 1000);
-        int sourceBytes = previousAudioLength - (previousAudioLength % frameBytes);
-        if (sourceBytes <= 0) return 0;
-
-        // Beta 62 retained-audio bridge: sender packets are only about 5 ms long,
-        // so a guard longer than one packet must synthesize continuity rather than
-        // stop at previousAudioLength. Reflect (ping-pong) the last good packet by
-        // whole audio frames: last -> first -> last. The endpoints therefore meet
-        // without the hard end-to-start discontinuity of a simple loop.
-        int guardBytes = bytesPerMs * Math.max(1, guardMs);
+        int guardBytes = Math.min(previousAudioLength, bytesPerMs * Math.max(1, guardMs));
         guardBytes -= guardBytes % frameBytes;
         if (guardBytes <= 0) return 0;
 
+        // Beta 63 bounded tail bridge: use only real samples from the end of the last
+        // good packet. Do not ping-pong or loop them to manufacture a longer waveform.
         byte[] guard = new byte[guardBytes];
-        int sourceFrames = Math.max(1, sourceBytes / frameBytes);
-        int guardFrames = Math.max(1, guardBytes / frameBytes);
-        int reflectionPeriod = sourceFrames <= 1 ? 1 : (sourceFrames - 1) * 2;
+        int sourceStart = previousAudioLength - guardBytes;
+        int sampleCount = Math.max(1, guardBytes / 2);
 
-        // Continue the same gentle envelope across successive watchdog guards.
-        // Never fade toward silence: the purpose of this bridge is specifically to
-        // keep AudioTrack fed until live PCM returns.
-        int startGainPercent = Math.max(65, 100 - (Math.max(0, guardIndex) * 7));
-        int endGainPercent = Math.max(65, startGainPercent - 7);
+        int startGainPercent = Math.max(72, 100 - (Math.max(0, guardIndex) * 9));
+        int endGainPercent = Math.max(72, startGainPercent - 9);
 
-        for (int frame = 0; frame < guardFrames; frame++) {
-            int reflected = reflectionPeriod <= 1 ? 0 : frame % reflectionPeriod;
-            int sourceFrame;
-            if (sourceFrames <= 1) {
-                sourceFrame = 0;
-            } else if (reflected <= sourceFrames - 1) {
-                sourceFrame = (sourceFrames - 1) - reflected;
-            } else {
-                sourceFrame = reflected - (sourceFrames - 1);
-            }
+        for (int i = 0; i < guardBytes; i += 2) {
+            int source = sourceStart + i;
+            int sample = (short) ((previousAudioPacket[source] & 0xff)
+                    | (previousAudioPacket[source + 1] << 8));
 
+            int sampleIndex = i / 2;
             int gainPercent = startGainPercent
-                    - (((startGainPercent - endGainPercent) * frame)
-                    / Math.max(1, guardFrames - 1));
-            int sourceFrameOffset = sourceFrame * frameBytes;
-            int guardFrameOffset = frame * frameBytes;
-
-            for (int channel = 0; channel < channels; channel++) {
-                int source = sourceFrameOffset + (channel * 2);
-                int target = guardFrameOffset + (channel * 2);
-                int sample = (short) ((previousAudioPacket[source] & 0xff)
-                        | (previousAudioPacket[source + 1] << 8));
-                int scaled = (sample * gainPercent) / 100;
-                guard[target] = (byte) (scaled & 0xff);
-                guard[target + 1] = (byte) ((scaled >> 8) & 0xff);
-            }
+                    - (((startGainPercent - endGainPercent) * sampleIndex)
+                    / Math.max(1, sampleCount - 1));
+            int scaled = (sample * gainPercent) / 100;
+            guard[i] = (byte) (scaled & 0xff);
+            guard[i + 1] = (byte) ((scaled >> 8) & 0xff);
         }
 
         int writtenTotal = 0;

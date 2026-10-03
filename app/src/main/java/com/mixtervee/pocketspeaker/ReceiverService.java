@@ -316,9 +316,10 @@ public class ReceiverService extends Service {
         // Beta 22: restore Beta 20's proven AudioTrack capacity and UDP behavior.
         // Request Android's explicit low-latency output flag in addition to PERFORMANCE_MODE_LOW_LATENCY.
         final int fallbackCushionMs = 50;
-        // Beta 48: keep a tiny 10 ms live reserve. Beta 47 proved the epoch recovery;
-        // this reserve is only to bridge brief scheduler starvation before a real underrun.
-        final int adaptiveCushionMs = 10;
+        // Beta 52: preserve Beta 51's live-edge recovery, but give normal playback
+        // 6 ms more scheduler headroom. This remains a very small reserve and should
+        // prevent many starvation events without giving back the low-latency character.
+        final int adaptiveCushionMs = 16;
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
         int cleanStartupPackets = 0;
@@ -329,7 +330,7 @@ public class ReceiverService extends Service {
         int recoveredPackets = 0;
         int softRecoveries = 0;
         boolean recoveryRefill = false;
-        final int recoveryRefillMs = 14;
+        final int recoveryRefillMs = 20;
         byte[] previousAudioPacket = null;
         int previousAudioLength = 0;
         boolean receivedFirstAudio = false;
@@ -538,12 +539,12 @@ public class ReceiverService extends Service {
                 boolean alreadyStarved =
                         playbackStarted && currentUnderruns > lastObservedUnderruns;
 
-                // Beta 51: keep the controlled local recovery from Beta 50, but
-                // never preserve stale network audio. An AudioTrack underrun means
-                // the receiver has fallen behind live time. Pause/flush the empty
-                // output, drain datagrams already queued on the phone, drop the packet
-                // that exposed the underrun, then rebuild only a tiny ~14 ms reserve
-                // from newly arriving packets before resuming.
+                // Beta 52: retain Beta 51's fresh-live-edge recovery, with a slightly
+                // safer refill. An AudioTrack underrun means the receiver has fallen
+                // behind live time. Pause/flush the empty output, drain datagrams already
+                // queued on the phone, drop the packet that exposed the underrun, then
+                // rebuild only a small ~20 ms reserve from newly arriving packets before
+                // resuming. The extra 6 ms is intentionally conservative.
                 if (alreadyStarved) {
                     try {
                         audioTrack.pause();

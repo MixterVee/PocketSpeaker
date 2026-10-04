@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -27,6 +29,9 @@ internal sealed class Sender : IDisposable
 {
     private readonly Action<string> status;
     private readonly object gate = new();
+    private readonly ConcurrentQueue<byte[]> udpQueue = new();
+    private readonly AutoResetEvent udpReady = new(false);
+    private int udpQueuedPackets;
     private UdpClient? control;
     private UdpClient? udp;
     private TcpClient? tcp;
@@ -54,6 +59,7 @@ internal sealed class Sender : IDisposable
         if (running) return;
         running = true;
         _ = Task.Run(ControlLoop);
+        _ = Task.Run(UdpSendLoop);
         StartCapture();
         status($"Ready — waiting for phone. Source name: {SourceName}");
     }
@@ -74,14 +80,16 @@ internal sealed class Sender : IDisposable
                 byte[] pcm = ConvertToPcm16(e.Buffer, e.BytesRecorded, capture.WaveFormat);
                 if (pcm.Length == 0) return;
 
-                if (lowLatency) SendUdp(pcm);
+                if (lowLatency) QueueUdpPcm(pcm);
                 else SendTcp(pcm);
 
                 if (!firstAudioReported)
                 {
                     firstAudioReported = true;
+                    int callbackMs = Math.Max(1, (pcm.Length * 1000) /
+                        Math.Max(1, captureSampleRate * Math.Min(captureChannels, 2) * 2));
                     status($"Audio streaming • {captureSampleRate} Hz • {Math.Min(captureChannels, 2)} ch • " +
-                           (lowLatency ? "LOW LATENCY UDP" : "STABLE TCP"));
+                           (lowLatency ? $"LOW LATENCY UDP • WASAPI chunk {callbackMs} ms" : "STABLE TCP"));
                 }
             }
             catch (Exception ex)
@@ -195,6 +203,7 @@ internal sealed class Sender : IDisposable
                 resyncId = 0;
                 firstAudioReported = false;
                 packetsSent = 0;
+                ClearUdpQueue();
                 if (lowLatency)
                 {
                     tcp?.Dispose();
@@ -230,43 +239,126 @@ internal sealed class Sender : IDisposable
         status($"Connected to phone at {ip} • STABLE TCP.");
     }
 
-    private void SendUdp(byte[] pcm)
+    private void QueueUdpPcm(byte[] pcm)
     {
-        var target = phone;
-        var sock = udp;
-        if (target is null || sock is null) return;
-        const int header = 28;
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
         int payload = Math.Max(bytesPerFrame, (captureSampleRate * bytesPerFrame) / 200); // ~5 ms
         payload -= payload % bytesPerFrame;
+        if (payload <= 0) return;
+
         for (int off = 0; off < pcm.Length;)
         {
             int len = Math.Min(payload, pcm.Length - off);
             len -= len % bytesPerFrame;
             if (len <= 0) break;
-            byte[] packet = new byte[header + len];
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(0, 4), Protocol.UdpAudioMagic);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(4, 4), ++sequence);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(8, 4), resyncId);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(12, 4), captureSampleRate);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(16, 4), channels);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(20, 4), 2);
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(24, 4), SenderTransport());
-            Buffer.BlockCopy(pcm, off, packet, header, len);
-            try
-            {
-                sock.Send(packet, packet.Length, new IPEndPoint(target.Address, phoneAudioPort));
-            }
-            catch (ObjectDisposedException)
-            {
-                // Reconnect can replace the UDP socket while capture is in flight.
-                // Drop only this stale packet; keep historical audio behavior unchanged.
-                return;
-            }
-            packetsSent++;
+
+            byte[] chunk = new byte[len];
+            Buffer.BlockCopy(pcm, off, chunk, 0, len);
+            udpQueue.Enqueue(chunk);
+            Interlocked.Increment(ref udpQueuedPackets);
             off += len;
         }
+
+        // Never let Windows build a large hidden delay. If scheduling ever falls behind
+        // by more than about 150 ms, jump forward to roughly 60 ms of fresh audio.
+        if (Volatile.Read(ref udpQueuedPackets) > 30)
+        {
+            while (Volatile.Read(ref udpQueuedPackets) > 12 && udpQueue.TryDequeue(out _))
+                Interlocked.Decrement(ref udpQueuedPackets);
+        }
+
+        udpReady.Set();
+    }
+
+    private async Task UdpSendLoop()
+    {
+        long frequency = Stopwatch.Frequency;
+        long packetTicks = Math.Max(1, frequency / 200); // 5 ms
+        long next = 0;
+
+        while (running)
+        {
+            if (!lowLatency || phone is null || udp is null)
+            {
+                ClearUdpQueue();
+                udpReady.WaitOne(20);
+                next = 0;
+                continue;
+            }
+
+            if (!udpQueue.TryDequeue(out byte[]? chunk))
+            {
+                udpReady.WaitOne(10);
+                next = 0;
+                continue;
+            }
+            Interlocked.Decrement(ref udpQueuedPackets);
+
+            long now = Stopwatch.GetTimestamp();
+            if (next == 0 || now - next > frequency / 10)
+                next = now;
+
+            while (running)
+            {
+                now = Stopwatch.GetTimestamp();
+                long remain = next - now;
+                if (remain <= 0) break;
+
+                double ms = remain * 1000.0 / frequency;
+                if (ms > 2.0)
+                    Thread.Sleep(1);
+                else
+                    Thread.SpinWait(100);
+            }
+
+            try
+            {
+                SendUdpPacket(chunk);
+            }
+            catch (Exception ex)
+            {
+                status("UDP send error: " + ex.Message);
+            }
+
+            next += packetTicks;
+            await Task.Yield();
+        }
+    }
+
+    private void SendUdpPacket(byte[] pcm)
+    {
+        var target = phone;
+        var sock = udp;
+        if (target is null || sock is null || pcm.Length == 0) return;
+
+        int channels = Math.Min(captureChannels, 2);
+        byte[] packet = new byte[28 + pcm.Length];
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(0, 4), Protocol.UdpAudioMagic);
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(4, 4), ++sequence);
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(8, 4), resyncId);
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(12, 4), captureSampleRate);
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(16, 4), channels);
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(20, 4), 2);
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(24, 4), SenderTransport());
+        Buffer.BlockCopy(pcm, 0, packet, 28, pcm.Length);
+        try
+        {
+            sock.Send(packet, packet.Length, new IPEndPoint(target.Address, phoneAudioPort));
+        }
+        catch (ObjectDisposedException)
+        {
+            // Reconnect can replace the UDP socket while the sender thread is in flight.
+            // Drop only this stale packet; preserve historical pacing behavior.
+            return;
+        }
+        packetsSent++;
+    }
+
+    private void ClearUdpQueue()
+    {
+        while (udpQueue.TryDequeue(out _)) { }
+        Interlocked.Exchange(ref udpQueuedPackets, 0);
     }
 
     private void SendTcp(byte[] pcm)
@@ -304,6 +396,8 @@ internal sealed class Sender : IDisposable
     public void Dispose()
     {
         running = false;
+        udpReady.Set();
+        ClearUdpQueue();
         try { capture?.StopRecording(); } catch { }
         capture?.Dispose();
         control?.Dispose();
@@ -320,7 +414,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta5 USB W1";
+        Text = "Pocket Speaker — Beta5 USB W2";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;

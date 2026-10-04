@@ -50,6 +50,7 @@ internal sealed class Sender : IDisposable
     private WaveFormatEncoding captureEncoding = WaveFormatEncoding.IeeeFloat;
     private long packetsSent;
     private bool firstAudioReported;
+    private string captureFormatLabel = "";
     public string SourceName { get; private set; } = Environment.MachineName;
 
     public Sender(Action<string> status) => this.status = status;
@@ -71,6 +72,7 @@ internal sealed class Sender : IDisposable
         captureChannels = Math.Max(1, capture.WaveFormat.Channels);
         captureBits = capture.WaveFormat.BitsPerSample;
         captureEncoding = capture.WaveFormat.Encoding;
+        captureFormatLabel = DescribeWaveFormat(capture.WaveFormat);
 
         capture.DataAvailable += (_, e) =>
         {
@@ -88,7 +90,7 @@ internal sealed class Sender : IDisposable
                     firstAudioReported = true;
                     int callbackMs = Math.Max(1, (pcm.Length * 1000) /
                         Math.Max(1, captureSampleRate * Math.Min(captureChannels, 2) * 2));
-                    status($"Audio streaming • {captureSampleRate} Hz • {Math.Min(captureChannels, 2)} ch • " +
+                    status($"Audio streaming • {captureFormatLabel} • {Math.Min(captureChannels, 2)} ch • " +
                            (lowLatency ? $"LOW LATENCY UDP • WASAPI chunk {callbackMs} ms" : "STABLE TCP"));
                 }
             }
@@ -102,7 +104,7 @@ internal sealed class Sender : IDisposable
             if (e.Exception != null) status("Capture stopped: " + e.Exception.Message);
         };
         capture.StartRecording();
-        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch.");
+        status($"Ready — waiting for phone. Capturing {captureFormatLabel} / {captureChannels} ch.");
     }
 
     private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)
@@ -120,8 +122,17 @@ internal sealed class Sender : IDisposable
         int outIndex = 0;
 
         bool float32 = fmt.BitsPerSample == 32 &&
-                       (fmt.Encoding == WaveFormatEncoding.IeeeFloat ||
-                        fmt.Encoding == WaveFormatEncoding.Extensible);
+                       fmt.Encoding == WaveFormatEncoding.IeeeFloat;
+
+        if (fmt.BitsPerSample == 32 &&
+            fmt.Encoding == WaveFormatEncoding.Extensible &&
+            fmt is WaveFormatExtensible ext)
+        {
+            // WAVE_FORMAT_EXTENSIBLE is only a container. Its SubFormat tells us
+            // whether the 32-bit samples are IEEE float or integer PCM.
+            Guid ieeeFloat = new("00000003-0000-0010-8000-00AA00389B71");
+            float32 = ext.SubFormat == ieeeFloat;
+        }
 
         for (int frame = 0; frame < frames; frame++)
         {
@@ -163,6 +174,25 @@ internal sealed class Sender : IDisposable
             }
         }
         return output;
+    }
+
+    private static string DescribeWaveFormat(WaveFormat fmt)
+    {
+        if (fmt.Encoding == WaveFormatEncoding.Extensible &&
+            fmt is WaveFormatExtensible ext)
+        {
+            Guid pcm = new("00000001-0000-0010-8000-00AA00389B71");
+            Guid ieeeFloat = new("00000003-0000-0010-8000-00AA00389B71");
+            string subtype = ext.SubFormat == ieeeFloat ? "Float"
+                : ext.SubFormat == pcm ? "PCM"
+                : "Other";
+            int validBits = ext.ValidBitsPerSample > 0
+                ? ext.ValidBitsPerSample : fmt.BitsPerSample;
+            return $"{fmt.SampleRate} Hz Extensible {subtype}{fmt.BitsPerSample}/{validBits}";
+        }
+
+        string kind = fmt.Encoding == WaveFormatEncoding.IeeeFloat ? "Float" : fmt.Encoding.ToString();
+        return $"{fmt.SampleRate} Hz {kind}{fmt.BitsPerSample}";
     }
 
     private async Task ControlLoop()
@@ -414,7 +444,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta5 USB W2";
+        Text = "Pocket Speaker — Beta5 USB W3";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;

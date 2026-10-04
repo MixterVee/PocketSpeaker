@@ -186,9 +186,7 @@ internal sealed class Sender : IDisposable
             string subtype = ext.SubFormat == ieeeFloat ? "Float"
                 : ext.SubFormat == pcm ? "PCM"
                 : "Other";
-            int validBits = ext.ValidBitsPerSample > 0
-                ? ext.ValidBitsPerSample : fmt.BitsPerSample;
-            return $"{fmt.SampleRate} Hz Extensible {subtype}{fmt.BitsPerSample}/{validBits}";
+            return $"{fmt.SampleRate} Hz Extensible {subtype}{fmt.BitsPerSample}";
         }
 
         string kind = fmt.Encoding == WaveFormatEncoding.IeeeFloat ? "Float" : fmt.Encoding.ToString();

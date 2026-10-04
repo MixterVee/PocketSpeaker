@@ -323,13 +323,8 @@ public class ReceiverService extends Service {
         final int fallbackStartupGuardMs = 35;
         final int adaptiveStartupGuardMs = 0;
         final int predictiveGuardThresholdMs = 34;
-        // Beta 63: conceal only the very front edge of a stall. Beta 62 could keep
-        // synthesizing reflected retained audio for up to 180 ms, which turned a hard
-        // gap into prolonged digital dribble. Limit the bridge to about 15 ms total;
-        // beyond that, abandon synthetic audio and restart on a fresh sender epoch.
-        final int predictiveGuardMs = 5;
-        final int maxPredictiveGuardsPerGap = 3;
-        final int hardRecoveryAfterMs = 45;
+        final int predictiveGuardMs = 4;
+        final int maxPredictiveGuardsPerGap = 5;
         int cleanStartupPackets = 0;
         int selectedCushionMs = fallbackCushionMs;
         int selectedStartupGuardMs = fallbackStartupGuardMs;
@@ -342,6 +337,13 @@ public class ReceiverService extends Service {
         int catchupEvents = 0;
         int healthyPacketsSinceCatchup = 0;
         long guardDebtFrames = 0L;
+        // Beta 64: Beta 58 is the reference engine. Leave healthy audio completely alone.
+        // Only if AudioTrack underruns repeatedly within a short window do we declare that
+        // the soft recovery itself has failed and request one clean fresh-epoch restart.
+        int collapseUnderrunEvents = 0;
+        long collapseWindowStartedAtMs = 0L;
+        final long collapseWindowMs = 2500L;
+        final int collapseUnderrunThreshold = 2;
         int guardsThisGap = 0;
         boolean recoveryRefill = false;
         final int recoveryRefillMs = 28;
@@ -386,7 +388,7 @@ public class ReceiverService extends Service {
                     long silentForMs = lastAudioPacketAtMs > 0L
                             ? timeoutNow - lastAudioPacketAtMs : Long.MAX_VALUE;
 
-                    // Beta 55 watchdog: a 10 ms receive timeout is not a disconnect.
+                    // Beta 64 keeps Beta 58's watchdog unchanged: a 10 ms receive timeout is not a disconnect.
                     // It is an opportunity to inspect the real AudioTrack reserve while
                     // no packet is arriving. If the reserve is already near starvation,
                     // intervene sooner, while the reserve is still recoverable, with several
@@ -426,38 +428,6 @@ public class ReceiverService extends Service {
                                 proactiveGuards++;
                                 guardsThisGap++;
                             }
-                        }
-
-                        // Beta 63 hard escape: once the short concealment budget is gone,
-                        // do not keep repeating/stretched PCM. Drop the stale output queue,
-                        // request a fresh sender epoch, and restart with only the small
-                        // recovery refill. This trades a bounded clean gap for Beta 62's
-                        // prolonged digital corruption and also resets latency immediately.
-                        if (playbackStarted
-                                && !waitingForFreshEpoch
-                                && silentForMs >= hardRecoveryAfterMs
-                                && guardsThisGap >= maxPredictiveGuardsPerGap) {
-                            try {
-                                if (audioTrack != null) audioTrack.pause();
-                                if (audioTrack != null) audioTrack.flush();
-                            } catch (Exception ignored) {
-                            }
-                            playbackStarted = false;
-                            bufferedBeforePlay = 0;
-                            totalFramesWritten = 0L;
-                            guardDebtFrames = 0L;
-                            healthyPacketsSinceCatchup = 0;
-                            previousAudioPacket = null;
-                            previousAudioLength = 0;
-                            lastSequence = -1;
-                            waitingForFreshEpoch = true;
-                            cleanStartupPackets = 6;
-                            selectedCushionMs = adaptiveCushionMs;
-                            selectedStartupGuardMs = adaptiveStartupGuardMs;
-                            guardsThisGap = 0;
-                            recoveryRefill = true;
-                            sendRecoveryConnectRequest(senderIp);
-                            sendStatus("UDP hard gap • clean low-latency recovery…");
                         }
                         continue;
                     }
@@ -655,9 +625,61 @@ public class ReceiverService extends Service {
                 // hiccup in Beta 54. Keep the stream running and smooth the handoff from the
                 // last good PCM into the newly arrived live packet instead.
                 if (alreadyStarved) {
+                    long collapseNowMs = System.currentTimeMillis();
+                    int newUnderruns = Math.max(
+                            1, currentUnderruns - lastObservedUnderruns);
+
+                    if (collapseWindowStartedAtMs == 0L
+                            || collapseNowMs - collapseWindowStartedAtMs > collapseWindowMs) {
+                        collapseWindowStartedAtMs = collapseNowMs;
+                        collapseUnderrunEvents = newUnderruns;
+                    } else {
+                        collapseUnderrunEvents += newUnderruns;
+                    }
+
+                    // The first underrun still gets Beta 58's proven soft crossfade recovery.
+                    // A second real AudioTrack underrun inside 2.5 s means the stream is no
+                    // longer stabilising. Do one clean epoch restart here rather than letting
+                    // a damaged state persist for the rest of the song.
+                    if (collapseUnderrunEvents >= collapseUnderrunThreshold) {
+                        try {
+                            if (audioTrack != null) audioTrack.pause();
+                            if (audioTrack != null) audioTrack.flush();
+                        } catch (Exception ignored) {
+                        }
+
+                        playbackStarted = false;
+                        bufferedBeforePlay = 0;
+                        totalFramesWritten = 0L;
+                        guardDebtFrames = 0L;
+                        healthyPacketsSinceCatchup = 0;
+                        previousAudioPacket = null;
+                        previousAudioLength = 0;
+                        lastSequence = -1;
+                        waitingForFreshEpoch = true;
+                        cleanStartupPackets = 6;
+                        selectedCushionMs = adaptiveCushionMs;
+                        selectedStartupGuardMs = adaptiveStartupGuardMs;
+                        recoveryRefill = true;
+                        collapseUnderrunEvents = 0;
+                        collapseWindowStartedAtMs = 0L;
+
+                        sendRecoveryConnectRequest(senderIp);
+                        sendStatus("UDP recovery collapse • fresh low-latency restart…");
+                        continue;
+                    }
+
                     softRecoveries++;
                     lastObservedUnderruns =
                             Math.max(lastObservedUnderruns, currentUnderruns);
+                } else if (collapseWindowStartedAtMs > 0L
+                        && System.currentTimeMillis() - collapseWindowStartedAtMs
+                                > collapseWindowMs) {
+                    // A single underrun that recovered cleanly is forgotten after the
+                    // observation window. This keeps Beta 64 from accumulating history
+                    // and disturbing otherwise healthy playback later.
+                    collapseUnderrunEvents = 0;
+                    collapseWindowStartedAtMs = 0L;
                 }
                 lastObservedUnderruns = Math.max(lastObservedUnderruns, currentUnderruns);
 
@@ -667,8 +689,8 @@ public class ReceiverService extends Service {
                         && previousAudioLength > 0
                         && (alreadyStarved || guardsBeforePacket > 0)) {
                     int crossfadeMs = alreadyStarved ? 14 : 9;
-                    // Beta 58: keep Beta 57's guard envelope and latency settings, but make the
-                    // return to live audio more gradual. A slightly longer return crossfade
+                    // Beta 64 reference path: keep Beta 58's guard envelope and latency settings;
+                    // keep the Beta 58 gradual return. Its slightly longer return crossfade
                     // hides the recovery seam without adding any permanent buffer or cushion.
                     int returnStartGainPercent = guardsBeforePacket > 0
                             ? Math.max(65, 100 - (guardsBeforePacket * 7))
@@ -754,9 +776,7 @@ public class ReceiverService extends Service {
                         && previousAudioLength > 0) {
                     int bytesPerMs = Math.max(1, (sampleRate * channels * 2) / 1000);
                     int previousPacketMs = Math.max(1, previousAudioLength / bytesPerMs);
-                    // Beta 63: sequence-loss concealment gets the same short budget as
-                    // the watchdog bridge. Never repeat old PCM for tens of milliseconds.
-                    int maxRecoveryPackets = Math.max(1, 15 / previousPacketMs);
+                    int maxRecoveryPackets = Math.max(1, 60 / previousPacketMs);
                     int packetsToRecover = Math.min(missingPackets, maxRecoveryPackets);
                     byte[] concealed = new byte[previousAudioLength];
 
@@ -905,14 +925,16 @@ public class ReceiverService extends Service {
         guardBytes -= guardBytes % frameBytes;
         if (guardBytes <= 0) return 0;
 
-        // Beta 63 bounded tail bridge: use only real samples from the end of the last
-        // good packet. Do not ping-pong or loop them to manufacture a longer waveform.
         byte[] guard = new byte[guardBytes];
         int sourceStart = previousAudioLength - guardBytes;
         int sampleCount = Math.max(1, guardBytes / 2);
 
-        int startGainPercent = Math.max(72, 100 - (Math.max(0, guardIndex) * 9));
-        int endGainPercent = Math.max(72, startGainPercent - 9);
+        // Beta 57: when a stall needs several guards, keep one continuous gain
+        // envelope across them. Beta 56 restarted every 4 ms guard at 100% after
+        // ending the previous one near 70%, which could sound like a tiny dropout/
+        // pulse even though AudioTrack never actually went silent.
+        int startGainPercent = Math.max(65, 100 - (Math.max(0, guardIndex) * 7));
+        int endGainPercent = Math.max(65, startGainPercent - 7);
 
         for (int i = 0; i < guardBytes; i += 2) {
             int source = sourceStart + i;

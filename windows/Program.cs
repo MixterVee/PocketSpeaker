@@ -34,11 +34,12 @@ internal sealed class Sender : IDisposable
     private int udpQueuedPackets;
     private byte[] udpPending = new byte[4096];
     private int udpPendingCount;
+    private int senderTransport;
     private UdpClient? control;
     private UdpClient? udp;
     private TcpClient? tcp;
     private NetworkStream? tcpStream;
-    private WasapiLoopbackCapture? capture;
+    private WasapiRecorder? capture;
     private IPEndPoint? phone;
     private int phoneAudioPort = Protocol.UdpAudioPort;
     private int phoneResyncPort = Protocol.ResyncPort;
@@ -52,7 +53,6 @@ internal sealed class Sender : IDisposable
     private WaveFormatEncoding captureEncoding = WaveFormatEncoding.IeeeFloat;
     private long packetsSent;
     private bool firstAudioReported;
-    private string captureFormatLabel = "";
     public string SourceName { get; private set; } = Environment.MachineName;
 
     public Sender(Action<string> status) => this.status = status;
@@ -62,26 +62,38 @@ internal sealed class Sender : IDisposable
         if (running) return;
         running = true;
         _ = Task.Run(ControlLoop);
-        _ = Task.Run(UdpSendLoop);
+        var udpThread = new Thread(UdpSendLoop)
+        {
+            IsBackground = true,
+            Name = "PocketSpeaker-UDP",
+            Priority = ThreadPriority.Highest
+        };
+        udpThread.Start();
         StartCapture();
         status($"Ready — waiting for phone. Source name: {SourceName}");
     }
 
     private void StartCapture()
     {
-        capture = new WasapiLoopbackCapture();
+        capture = new WasapiRecorderBuilder()
+            .WithLoopbackCapture()
+            .WithEventSync()
+            .WithBufferLength(20)
+            .WithMmcssThreadPriority("Pro Audio")
+            .Build();
+
         captureSampleRate = capture.WaveFormat.SampleRate;
         captureChannels = Math.Max(1, capture.WaveFormat.Channels);
         captureBits = capture.WaveFormat.BitsPerSample;
         captureEncoding = capture.WaveFormat.Encoding;
-        captureFormatLabel = DescribeWaveFormat(capture.WaveFormat);
 
-        capture.DataAvailable += (_, e) =>
+        capture.DataAvailable += (buffer, flags, devicePosition, qpcPosition) =>
         {
             try
             {
-                if (phone is null || e.BytesRecorded <= 0) return;
-                byte[] pcm = ConvertToPcm16(e.Buffer, e.BytesRecorded, capture.WaveFormat);
+                if (phone is null || buffer.Length <= 0) return;
+                byte[] raw = buffer.ToArray();
+                byte[] pcm = ConvertToPcm16(raw, raw.Length, capture.WaveFormat);
                 if (pcm.Length == 0) return;
 
                 if (lowLatency) QueueUdpPcm(pcm);
@@ -92,8 +104,8 @@ internal sealed class Sender : IDisposable
                     firstAudioReported = true;
                     int callbackMs = Math.Max(1, (pcm.Length * 1000) /
                         Math.Max(1, captureSampleRate * Math.Min(captureChannels, 2) * 2));
-                    status($"Audio streaming • {captureFormatLabel} • {Math.Min(captureChannels, 2)} ch • " +
-                           (lowLatency ? $"LOW LATENCY UDP • WASAPI chunk {callbackMs} ms" : "STABLE TCP"));
+                    status($"Audio streaming • {captureSampleRate} Hz • {Math.Min(captureChannels, 2)} ch • " +
+                           (lowLatency ? $"LOW LATENCY UDP • capture chunk {callbackMs} ms" : "STABLE TCP"));
                 }
             }
             catch (Exception ex)
@@ -101,12 +113,14 @@ internal sealed class Sender : IDisposable
                 status("Audio send error: " + ex.Message);
             }
         };
+
         capture.RecordingStopped += (_, e) =>
         {
             if (e.Exception != null) status("Capture stopped: " + e.Exception.Message);
         };
+
         capture.StartRecording();
-        status($"Ready — waiting for phone. Capturing {captureFormatLabel} / {captureChannels} ch.");
+        status($"Ready — waiting for phone. Capturing {capture.WaveFormat} • 20 ms WASAPI buffer.");
     }
 
     private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)
@@ -130,8 +144,6 @@ internal sealed class Sender : IDisposable
             fmt.Encoding == WaveFormatEncoding.Extensible &&
             fmt is WaveFormatExtensible ext)
         {
-            // WAVE_FORMAT_EXTENSIBLE is only a container. Its SubFormat tells us
-            // whether the 32-bit samples are IEEE float or integer PCM.
             Guid ieeeFloat = new("00000003-0000-0010-8000-00AA00389B71");
             float32 = ext.SubFormat == ieeeFloat;
         }
@@ -178,23 +190,6 @@ internal sealed class Sender : IDisposable
         return output;
     }
 
-    private static string DescribeWaveFormat(WaveFormat fmt)
-    {
-        if (fmt.Encoding == WaveFormatEncoding.Extensible &&
-            fmt is WaveFormatExtensible ext)
-        {
-            Guid pcm = new("00000001-0000-0010-8000-00AA00389B71");
-            Guid ieeeFloat = new("00000003-0000-0010-8000-00AA00389B71");
-            string subtype = ext.SubFormat == ieeeFloat ? "Float"
-                : ext.SubFormat == pcm ? "PCM"
-                : "Other";
-            return $"{fmt.SampleRate} Hz Extensible {subtype}{fmt.BitsPerSample}";
-        }
-
-        string kind = fmt.Encoding == WaveFormatEncoding.IeeeFloat ? "Float" : fmt.Encoding.ToString();
-        return $"{fmt.SampleRate} Hz {kind}{fmt.BitsPerSample}";
-    }
-
     private async Task ControlLoop()
     {
         control = new UdpClient(new IPEndPoint(IPAddress.Any, Protocol.ControlPort));
@@ -229,6 +224,7 @@ internal sealed class Sender : IDisposable
                 phoneAudioPort = parts.Length > 2 && int.TryParse(parts[2], out var ap) ? ap : Protocol.UdpAudioPort;
                 lowLatency = parts.Length > 3 && parts[3].Equals("UDP", StringComparison.OrdinalIgnoreCase);
                 phone = new IPEndPoint(r.RemoteEndPoint.Address, lowLatency ? phoneAudioPort : streamPort);
+                senderTransport = DetermineSenderTransport(r.RemoteEndPoint.Address);
                 sequence = 0;
                 resyncId = 0;
                 firstAudioReported = false;
@@ -264,7 +260,7 @@ internal sealed class Sender : IDisposable
         WriteInt32(tcpStream, captureSampleRate);
         WriteInt32(tcpStream, Math.Min(captureChannels, 2));
         WriteInt32(tcpStream, 2);
-        WriteInt32(tcpStream, SenderTransport());
+        WriteInt32(tcpStream, senderTransport);
         await tcpStream.FlushAsync();
         status($"Connected to phone at {ip} • STABLE TCP.");
     }
@@ -273,13 +269,10 @@ internal sealed class Sender : IDisposable
     {
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
-        int payload = Math.Max(bytesPerFrame, (captureSampleRate * bytesPerFrame) / 200); // exactly ~5 ms
+        int payload = Math.Max(bytesPerFrame, (captureSampleRate * bytesPerFrame) / 200); // ~5 ms
         payload -= payload % bytesPerFrame;
-        if (payload <= 0 || pcm.Length <= 0) return;
+        if (payload <= 0) return;
 
-        // W4: never queue a short callback-tail packet as though it represented
-        // a full 5 ms of audio. Carry leftovers into the next capture callback
-        // and emit only complete 5 ms packets.
         int needed = udpPendingCount + pcm.Length;
         if (udpPending.Length < needed)
             Array.Resize(ref udpPending, Math.Max(needed, udpPending.Length * 2));
@@ -305,17 +298,18 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Keep the historical W2 latency guard.
-        if (Volatile.Read(ref udpQueuedPackets) > 30)
+        // Prevent sender-side latency from ever growing into the hundreds of milliseconds.
+        // If Windows scheduling slips, drop old queued audio and return to fresh audio.
+        if (Volatile.Read(ref udpQueuedPackets) > 20)
         {
-            while (Volatile.Read(ref udpQueuedPackets) > 12 && udpQueue.TryDequeue(out _))
+            while (Volatile.Read(ref udpQueuedPackets) > 10 && udpQueue.TryDequeue(out _))
                 Interlocked.Decrement(ref udpQueuedPackets);
         }
 
         udpReady.Set();
     }
 
-    private async Task UdpSendLoop()
+    private void UdpSendLoop()
     {
         long frequency = Stopwatch.Frequency;
         long packetTicks = Math.Max(1, frequency / 200); // 5 ms
@@ -340,7 +334,7 @@ internal sealed class Sender : IDisposable
             Interlocked.Decrement(ref udpQueuedPackets);
 
             long now = Stopwatch.GetTimestamp();
-            if (next == 0 || now - next > frequency / 10)
+            if (next == 0 || now - next > frequency / 20)
                 next = now;
 
             while (running)
@@ -352,8 +346,10 @@ internal sealed class Sender : IDisposable
                 double ms = remain * 1000.0 / frequency;
                 if (ms > 2.0)
                     Thread.Sleep(1);
+                else if (ms > 0.4)
+                    Thread.Yield();
                 else
-                    Thread.SpinWait(100);
+                    Thread.SpinWait(80);
             }
 
             try
@@ -366,7 +362,6 @@ internal sealed class Sender : IDisposable
             }
 
             next += packetTicks;
-            await Task.Yield();
         }
     }
 
@@ -384,7 +379,7 @@ internal sealed class Sender : IDisposable
         BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(12, 4), captureSampleRate);
         BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(16, 4), channels);
         BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(20, 4), 2);
-        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(24, 4), SenderTransport());
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(24, 4), senderTransport);
         Buffer.BlockCopy(pcm, 0, packet, 28, pcm.Length);
         try
         {
@@ -392,8 +387,6 @@ internal sealed class Sender : IDisposable
         }
         catch (ObjectDisposedException)
         {
-            // Reconnect can replace the UDP socket while the sender thread is in flight.
-            // Drop only this stale packet; preserve historical pacing behavior.
             return;
         }
         packetsSent++;
@@ -423,16 +416,43 @@ internal sealed class Sender : IDisposable
         s.Write(b);
     }
 
-    private static int SenderTransport()
+    private static int DetermineSenderTransport(IPAddress remoteAddress)
     {
         try
         {
-            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            IPAddress? localAddress = null;
+            using (var probe = new UdpClient(remoteAddress.AddressFamily))
             {
-                if (nic.OperationalStatus != OperationalStatus.Up) continue;
-                if (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet) return 2;
-                if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) return 1;
+                probe.Connect(remoteAddress, Protocol.ControlPort);
+                localAddress = (probe.Client.LocalEndPoint as IPEndPoint)?.Address;
             }
+
+            if (localAddress != null)
+            {
+                foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                    bool ownsAddress = nic.GetIPProperties().UnicastAddresses
+                        .Any(u => u.Address.Equals(localAddress));
+                    if (!ownsAddress) continue;
+
+                    if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) return 1;
+                    if (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet) return 2;
+                }
+            }
+
+            // Conservative fallback: prefer Wi-Fi if an active Wi-Fi interface exists.
+            // This gives the phone the slightly larger Wi-Fi cushion instead of misclassifying
+            // VPN/virtual Ethernet adapters as the real path.
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                if (nic.OperationalStatus == OperationalStatus.Up &&
+                    nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+                    return 1;
+
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                if (nic.OperationalStatus == OperationalStatus.Up &&
+                    nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet)
+                    return 2;
         }
         catch { }
         return 0;
@@ -459,7 +479,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta5 USB W4";
+        Text = "Pocket Speaker — Beta5 USB W5";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;

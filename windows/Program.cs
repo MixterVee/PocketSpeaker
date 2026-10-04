@@ -6,7 +6,6 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using NAudio.Wave;
-using NAudio.Wave.SampleProviders;
 
 namespace PocketSpeaker.Windows;
 
@@ -105,7 +104,7 @@ internal sealed class Sender : IDisposable
                     int callbackMs = Math.Max(1, (pcm.Length * 1000) /
                         Math.Max(1, captureSampleRate * Math.Min(captureChannels, 2) * 2));
                     status($"Audio streaming • {captureSampleRate} Hz • {Math.Min(captureChannels, 2)} ch • " +
-                           (lowLatency ? $"LOW LATENCY UDP • capture chunk {callbackMs} ms" : "STABLE TCP"));
+                           (lowLatency ? $"LOW LATENCY UDP • capture chunk {callbackMs} ms • smooth pacing" : "STABLE TCP"));
                 }
             }
             catch (Exception ex)
@@ -120,7 +119,7 @@ internal sealed class Sender : IDisposable
         };
 
         capture.StartRecording();
-        status($"Ready — waiting for phone. Capturing {capture.WaveFormat} • 20 ms WASAPI buffer.");
+        status($"Ready — waiting for phone. Capturing {captureSampleRate} Hz / {captureChannels} ch • 20 ms WASAPI buffer.");
     }
 
     private static byte[] ConvertToPcm16(byte[] input, int count, WaveFormat fmt)
@@ -222,7 +221,15 @@ internal sealed class Sender : IDisposable
                 int streamPort = parts.Length > 0 && int.TryParse(parts[0], out var sp) ? sp : Protocol.StreamPort;
                 phoneResyncPort = parts.Length > 1 && int.TryParse(parts[1], out var rp) ? rp : Protocol.ResyncPort;
                 phoneAudioPort = parts.Length > 2 && int.TryParse(parts[2], out var ap) ? ap : Protocol.UdpAudioPort;
-                lowLatency = parts.Length > 3 && parts[3].Equals("UDP", StringComparison.OrdinalIgnoreCase);
+                bool requestedLowLatency =
+                    parts.Length > 3 && parts[3].Equals("UDP", StringComparison.OrdinalIgnoreCase);
+                bool sameUdpClient = requestedLowLatency
+                    && lowLatency
+                    && udp != null
+                    && phone != null
+                    && phone.Address.Equals(r.RemoteEndPoint.Address);
+
+                lowLatency = requestedLowLatency;
                 phone = new IPEndPoint(r.RemoteEndPoint.Address, lowLatency ? phoneAudioPort : streamPort);
                 senderTransport = DetermineSenderTransport(r.RemoteEndPoint.Address);
                 sequence = 0;
@@ -230,14 +237,24 @@ internal sealed class Sender : IDisposable
                 firstAudioReported = false;
                 packetsSent = 0;
                 ClearUdpQueue();
+
                 if (lowLatency)
                 {
                     tcp?.Dispose();
                     tcp = null;
                     tcpStream = null;
-                    udp?.Dispose();
-                    udp = new UdpClient();
+
+                    // Repeated taps from the phone are harmless now. Keep a healthy UDP
+                    // socket instead of closing/reopening it in the middle of streaming.
+                    if (!sameUdpClient)
+                    {
+                        udp?.Dispose();
+                        udp = new UdpClient();
+                        udp.Client.SendBufferSize = 131072;
+                    }
+
                     status($"Connected to phone at {r.RemoteEndPoint.Address} • LOW LATENCY UDP.");
+                    udpReady.Set();
                 }
                 else
                 {
@@ -269,7 +286,9 @@ internal sealed class Sender : IDisposable
     {
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
-        int payload = Math.Max(bytesPerFrame, (captureSampleRate * bytesPerFrame) / 200); // ~5 ms
+        int desiredPayload = Math.Max(bytesPerFrame,
+            (captureSampleRate * bytesPerFrame * 7) / 1000); // target about 7 ms
+        int payload = Math.Min(1400, desiredPayload);       // stays below phone's 1600-byte receive buffer
         payload -= payload % bytesPerFrame;
         if (payload <= 0) return;
 
@@ -298,11 +317,11 @@ internal sealed class Sender : IDisposable
             udpPendingCount = remaining;
         }
 
-        // Prevent sender-side latency from ever growing into the hundreds of milliseconds.
-        // If Windows scheduling slips, drop old queued audio and return to fresh audio.
-        if (Volatile.Read(ref udpQueuedPackets) > 20)
+        // Emergency guard only. Normal clock drift is handled by the pacing servo below,
+        // so we no longer repeatedly chop the queue and create audible "catch-up" breakups.
+        if (Volatile.Read(ref udpQueuedPackets) > 45)
         {
-            while (Volatile.Read(ref udpQueuedPackets) > 10 && udpQueue.TryDequeue(out _))
+            while (Volatile.Read(ref udpQueuedPackets) > 14 && udpQueue.TryDequeue(out _))
                 Interlocked.Decrement(ref udpQueuedPackets);
         }
 
@@ -312,7 +331,6 @@ internal sealed class Sender : IDisposable
     private void UdpSendLoop()
     {
         long frequency = Stopwatch.Frequency;
-        long packetTicks = Math.Max(1, frequency / 200); // 5 ms
         long next = 0;
 
         while (running)
@@ -333,8 +351,31 @@ internal sealed class Sender : IDisposable
             }
             Interlocked.Decrement(ref udpQueuedPackets);
 
+            int channels = Math.Min(captureChannels, 2);
+            int bytesPerSecond = Math.Max(1, captureSampleRate * channels * 2);
+            double packetSeconds = chunk.Length / (double)bytesPerSecond;
+
+            // Tiny servo to follow the capture device's real clock rather than assuming its
+            // nominal 48 kHz clock is identical to Stopwatch and the phone's audio clock.
+            int depth = Volatile.Read(ref udpQueuedPackets);
+            double paceFactor = depth switch
+            {
+                >= 18 => 0.975,  // drain a backlog gently
+                >= 10 => 0.988,
+                >= 6  => 0.995,
+                0     => 1.004,  // avoid starving the phone when nearly empty
+                _     => 1.000
+            };
+            long packetTicks = Math.Max(1,
+                (long)(frequency * packetSeconds * paceFactor));
+
             long now = Stopwatch.GetTimestamp();
-            if (next == 0 || now - next > frequency / 20)
+            if (next == 0)
+                next = now;
+
+            // Never "catch up" by blasting several packets after a Windows scheduling stall.
+            // That was overflowing the phone's UDP receive queue and showing up as LOST packets.
+            if (now - next > packetTicks)
                 next = now;
 
             while (running)
@@ -361,7 +402,7 @@ internal sealed class Sender : IDisposable
                 status("UDP send error: " + ex.Message);
             }
 
-            next += packetTicks;
+            next = Stopwatch.GetTimestamp() + packetTicks;
         }
     }
 
@@ -381,14 +422,7 @@ internal sealed class Sender : IDisposable
         BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(20, 4), 2);
         BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(24, 4), senderTransport);
         Buffer.BlockCopy(pcm, 0, packet, 28, pcm.Length);
-        try
-        {
-            sock.Send(packet, packet.Length, new IPEndPoint(target.Address, phoneAudioPort));
-        }
-        catch (ObjectDisposedException)
-        {
-            return;
-        }
+        sock.Send(packet, packet.Length, new IPEndPoint(target.Address, phoneAudioPort));
         packetsSent++;
     }
 
@@ -479,7 +513,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta5 USB W5";
+        Text = "Pocket Speaker — Beta5 USB W6";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;
@@ -499,3 +533,4 @@ internal static class Program
         Application.Run(new MainForm());
     }
 }
+

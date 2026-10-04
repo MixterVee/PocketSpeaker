@@ -1,0 +1,50 @@
+name: Build Beta5 USB Test Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "beta5-usb-test" ]
+    paths:
+      - "windows/**"
+      - ".github/workflows/build-beta5-usb-test-windows.yml"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Create temporary Windows icon
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 256,256
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::FromArgb(24,28,34))
+          $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(81,196,133))
+          $g.FillEllipse($brush,28,28,200,200)
+          $font = New-Object System.Drawing.Font("Segoe UI",72,[System.Drawing.FontStyle]::Bold)
+          $g.DrawString("PS",$font,[System.Drawing.Brushes]::White,43,72)
+          $ico = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+          $fs = [System.IO.File]::Create("windows/app.ico")
+          $ico.Save($fs)
+          $fs.Close()
+          $g.Dispose()
+          $bmp.Dispose()
+
+      - name: Publish beta5 USB Windows sender
+        shell: pwsh
+        run: dotnet publish windows/PocketSpeaker.Windows.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o out
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketSpeaker-v1.1.0-beta5-USB-Test-Windows-x64
+          path: out/*

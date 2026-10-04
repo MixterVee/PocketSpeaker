@@ -499,24 +499,3 @@ internal static class Program
         Application.Run(new MainForm());
     }
 }
-
-internal sealed class StereoSampleProvider : ISampleProvider
-{
-    private readonly ISampleProvider source;
-    public StereoSampleProvider(ISampleProvider source) => this.source = source;
-    public WaveFormat WaveFormat => WaveFormat.CreateIeeeFloatWaveFormat(source.WaveFormat.SampleRate, 2);
-
-    public int Read(float[] buffer, int offset, int count)
-    {
-        int srcChannels = source.WaveFormat.Channels;
-        float[] temp = new float[(count / 2) * srcChannels];
-        int read = source.Read(temp, 0, temp.Length);
-        int frames = read / srcChannels;
-        for (int f = 0; f < frames; f++)
-        {
-            buffer[offset + f * 2] = temp[f * srcChannels];
-            buffer[offset + f * 2 + 1] = temp[f * srcChannels + Math.Min(1, srcChannels - 1)];
-        }
-        return frames * 2;
-    }
-}

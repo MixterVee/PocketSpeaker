@@ -193,7 +193,17 @@ internal sealed class Sender : IDisposable
             BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(20, 4), 2);
             BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(24, 4), SenderTransport());
             Buffer.BlockCopy(pcm, off, packet, header, len);
-            sock.Send(packet, packet.Length, new IPEndPoint(target.Address, phoneAudioPort));
+            try
+            {
+                sock.Send(packet, packet.Length, new IPEndPoint(target.Address, phoneAudioPort));
+            }
+            catch (ObjectDisposedException)
+            {
+                // A repeated CONNECT can replace the UDP socket while the capture callback
+                // is in flight. Drop only this stale packet; the next capture callback will
+                // use the replacement socket. Do not alter pacing/buffering for the USB test.
+                return;
+            }
             off += len;
         }
     }

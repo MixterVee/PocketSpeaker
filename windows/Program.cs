@@ -32,6 +32,8 @@ internal sealed class Sender : IDisposable
     private readonly ConcurrentQueue<byte[]> udpQueue = new();
     private readonly AutoResetEvent udpReady = new(false);
     private int udpQueuedPackets;
+    private byte[] udpPending = new byte[4096];
+    private int udpPendingCount;
     private UdpClient? control;
     private UdpClient? udp;
     private TcpClient? tcp;
@@ -271,25 +273,39 @@ internal sealed class Sender : IDisposable
     {
         int channels = Math.Min(captureChannels, 2);
         int bytesPerFrame = Math.Max(2, channels * 2);
-        int payload = Math.Max(bytesPerFrame, (captureSampleRate * bytesPerFrame) / 200); // ~5 ms
+        int payload = Math.Max(bytesPerFrame, (captureSampleRate * bytesPerFrame) / 200); // exactly ~5 ms
         payload -= payload % bytesPerFrame;
-        if (payload <= 0) return;
+        if (payload <= 0 || pcm.Length <= 0) return;
 
-        for (int off = 0; off < pcm.Length;)
+        // W4: never queue a short callback-tail packet as though it represented
+        // a full 5 ms of audio. Carry leftovers into the next capture callback
+        // and emit only complete 5 ms packets.
+        int needed = udpPendingCount + pcm.Length;
+        if (udpPending.Length < needed)
+            Array.Resize(ref udpPending, Math.Max(needed, udpPending.Length * 2));
+
+        Buffer.BlockCopy(pcm, 0, udpPending, udpPendingCount, pcm.Length);
+        udpPendingCount += pcm.Length;
+
+        int offset = 0;
+        while (udpPendingCount - offset >= payload)
         {
-            int len = Math.Min(payload, pcm.Length - off);
-            len -= len % bytesPerFrame;
-            if (len <= 0) break;
-
-            byte[] chunk = new byte[len];
-            Buffer.BlockCopy(pcm, off, chunk, 0, len);
+            byte[] chunk = new byte[payload];
+            Buffer.BlockCopy(udpPending, offset, chunk, 0, payload);
             udpQueue.Enqueue(chunk);
             Interlocked.Increment(ref udpQueuedPackets);
-            off += len;
+            offset += payload;
         }
 
-        // Never let Windows build a large hidden delay. If scheduling ever falls behind
-        // by more than about 150 ms, jump forward to roughly 60 ms of fresh audio.
+        if (offset > 0)
+        {
+            int remaining = udpPendingCount - offset;
+            if (remaining > 0)
+                Buffer.BlockCopy(udpPending, offset, udpPending, 0, remaining);
+            udpPendingCount = remaining;
+        }
+
+        // Keep the historical W2 latency guard.
         if (Volatile.Read(ref udpQueuedPackets) > 30)
         {
             while (Volatile.Read(ref udpQueuedPackets) > 12 && udpQueue.TryDequeue(out _))
@@ -387,6 +403,7 @@ internal sealed class Sender : IDisposable
     {
         while (udpQueue.TryDequeue(out _)) { }
         Interlocked.Exchange(ref udpQueuedPackets, 0);
+        udpPendingCount = 0;
     }
 
     private void SendTcp(byte[] pcm)
@@ -442,7 +459,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Pocket Speaker — Beta5 USB W3";
+        Text = "Pocket Speaker — Beta5 USB W4";
         Width = 520;
         Height = 260;
         StartPosition = FormStartPosition.CenterScreen;

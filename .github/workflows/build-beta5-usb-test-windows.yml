@@ -19,7 +19,7 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '9.0.x'
 
       - name: Create temporary Windows icon
         shell: pwsh
@@ -41,7 +41,7 @@ jobs:
 
       - name: Publish beta5 USB Windows sender
         shell: pwsh
-        run: dotnet publish windows/PocketSpeaker.Windows.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o out
+        run: dotnet publish windows/PocketSpeaker.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o out
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
